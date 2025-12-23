@@ -1,0 +1,1151 @@
+import sys
+import os
+from datetime import datetime, timezone
+
+import boto3
+from botocore.exceptions import ClientError
+
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+
+from pyspark.sql.functions import (
+    col,
+    struct,
+    collect_list,
+    explode_outer,
+    first,
+    lit,
+    when,
+    explode,
+)
+from pyspark.sql.types import StructType, StructField, StringType
+from pyspark.sql.functions import udf
+
+# ---------- Helpers ----------
+
+
+def ensure_prefix_uri(uri: str) -> str:
+    """
+    Ensure that an S3 URI prefix ends with a slash.
+    Example: "path/to/prefix" -> "path/to/prefix/".
+    """
+    if uri.endswith("/"):
+        return uri
+    return uri + "/"
+
+
+def list_s3_objects(bucket: str, prefix: str):
+    """
+    List all S3 object keys under a given prefix.
+    """
+    s3_client = boto3.client("s3")
+    keys = []
+    continuation_token = None
+
+    print(f"[INFO] Listing S3 objects in bucket='{bucket}', prefix='{prefix}'")
+
+    while True:
+        list_kwargs = {
+            "Bucket": bucket,
+            "Prefix": prefix,
+        }
+        if continuation_token:
+            list_kwargs["ContinuationToken"] = continuation_token
+
+        response = s3_client.list_objects_v2(**list_kwargs)
+        for item in response.get("Contents", []):
+            keys.append(item["Key"])
+
+        if response.get("IsTruncated"):
+            continuation_token = response.get("NextContinuationToken")
+        else:
+            break
+
+    print(f"[INFO] Found {len(keys)} object(s) under prefix '{prefix}'")
+    return keys
+
+
+def select_latest_category_mapping_key(bucket: str) -> str:
+    """
+    Find the newest Category_Mapping_Reference_<timestamp>.json in
+    INPUT_BUCKET/canonical_mappings/, based on the timestamp in the filename.
+
+    Returns the S3 key (without bucket). Raises RuntimeError if none found.
+    """
+    prefix = "canonical_mappings/"
+    all_keys = list_s3_objects(bucket, prefix)
+
+    candidates = []
+    for k in all_keys:
+        fname = k.split("/")[-1]
+        if not fname.startswith("Category_Mapping_Reference_"):
+            continue
+        if not fname.endswith(".json"):
+            continue
+        # Extract the <timestamp> between prefix and ".json"
+        base = fname[len("Category_Mapping_Reference_"):]
+        ts_str, ext = os.path.splitext(base)
+        if ts_str:
+            candidates.append((ts_str, k))
+
+    if not candidates:
+        raise RuntimeError(
+            f"No Category_Mapping_Reference_<timestamp>.json found under "
+            f"s3://{bucket}/{prefix}"
+        )
+
+    # Sort by timestamp string (YYYYMMDD[...]) – lexical order matches time order
+    candidates.sort(key=lambda x: x[0])
+    latest_ts, latest_key = candidates[-1]
+
+    print(
+        f"[INFO] Selected latest Category_Mapping_Reference file: "
+        f"s3://{bucket}/{latest_key} (timestamp={latest_ts})"
+    )
+    return latest_key
+
+
+# ---------- Glue entry point ----------
+
+# EXACTLY the arguments described:
+# - from job configuration: JOB_NAME, INPUT_BUCKET, OUTPUT_BUCKET
+# - from Lambda/Make: vendor_name, preprocessed_input_key, prepared_output_prefix
+args = getResolvedOptions(
+    sys.argv,
+    [
+        "JOB_NAME",
+        "INPUT_BUCKET",
+        "OUTPUT_BUCKET",
+        "vendor_name",
+        "preprocessed_input_key",
+        "prepared_output_prefix",
+    ],
+)
+
+job_name = args["JOB_NAME"]
+input_bucket = args["INPUT_BUCKET"]
+output_bucket = args["OUTPUT_BUCKET"]
+
+vendor_name = args["vendor_name"]
+preprocessed_input_prefix = ensure_prefix_uri(args["preprocessed_input_key"])
+prepared_output_prefix = ensure_prefix_uri(args["prepared_output_prefix"])
+
+print(f"[INFO] Job name: {job_name}")
+print(f"[INFO] INPUT_BUCKET: {input_bucket}")
+print(f"[INFO] OUTPUT_BUCKET: {output_bucket}")
+print(f"[INFO] vendor_name: {vendor_name}")
+print(f"[INFO] preprocessed_input_prefix: {preprocessed_input_prefix}")
+print(f"[INFO] prepared_output_prefix: {prepared_output_prefix}")
+
+sc = SparkContext()
+glue_context = GlueContext(sc)
+spark = glue_context.spark_session
+
+job = Job(glue_context)
+job.init(job_name, args)
+
+s3_client = boto3.client("s3")
+
+try:
+    # =========================================================
+    # PART-1 (unchanged): build <VENDOR_NAME>_forMapping_products
+    # =========================================================
+    print("[INFO] ===== PART-1: Building vendor_mappings on products =====")
+
+    # -------------------------
+    # 1) Locate and load input files
+    # -------------------------
+    all_keys = list_s3_objects(input_bucket, preprocessed_input_prefix)
+
+    # Expected file names (suffixes) under preprocessed_input_prefix
+    vendor_products_suffix = f"{vendor_name}_vendor_products.json"
+    product_links_suffix = f"{vendor_name}_product_category_links.json"
+    vendor_categories_suffix = f"{vendor_name}_vendor_categories.json"
+
+    vendor_products_keys = [
+        k for k in all_keys if k.endswith(vendor_products_suffix)
+    ]
+    product_links_keys = [
+        k for k in all_keys if k.endswith(product_links_suffix)
+    ]
+    vendor_categories_keys = [
+        k for k in all_keys if k.endswith(vendor_categories_suffix)
+    ]
+
+    if not vendor_products_keys:
+        raise RuntimeError(
+            f"No '{vendor_products_suffix}' file found under "
+            f"s3://{input_bucket}/{preprocessed_input_prefix}"
+        )
+    if not product_links_keys:
+        raise RuntimeError(
+            f"No '{product_links_suffix}' file found under "
+            f"s3://{input_bucket}/{preprocessed_input_prefix}"
+        )
+    if not vendor_categories_keys:
+        raise RuntimeError(
+            f"No '{vendor_categories_suffix}' file found under "
+            f"s3://{input_bucket}/{preprocessed_input_prefix}"
+        )
+
+    # If multiple files match, pick the first sorted one (deterministic)
+    vendor_products_keys.sort()
+    product_links_keys.sort()
+    vendor_categories_keys.sort()
+
+    vendor_products_key = vendor_products_keys[0]
+    product_links_key = product_links_keys[0]
+    vendor_categories_key = vendor_categories_keys[0]
+
+    vendor_products_uri = f"s3://{input_bucket}/{vendor_products_key}"
+    product_links_uri = f"s3://{input_bucket}/{product_links_key}"
+    vendor_categories_uri = f"s3://{input_bucket}/{vendor_categories_key}"
+
+    print(f"[INFO] Using vendor products file: {vendor_products_uri}")
+    print(f"[INFO] Using product-category links file: {product_links_uri}")
+    print(f"[INFO] Using vendor categories file: {vendor_categories_uri}")
+
+    vendor_products_df = spark.read.json(vendor_products_uri)
+    print(f"[INFO] Loaded vendor_products_df with {vendor_products_df.count()} rows")
+
+    product_links_df = spark.read.json(product_links_uri)
+    print(f"[INFO] Loaded product_category_links_df with {product_links_df.count()} rows")
+
+    vendor_categories_df = spark.read.json(vendor_categories_uri)
+    print(f"[INFO] Loaded vendor_categories_df with {vendor_categories_df.count()} rows")
+
+    # -------------------------
+    # 2) Build mappings: article_id + category_id + category metadata
+    # -------------------------
+    # Join product_category_links with vendor_categories on vendor_name + category_id
+    # so that for each (article_id, vendor_category_id) we get category_name/path/type.
+    links_with_cat_df = (
+        product_links_df.alias("l")
+        .join(
+            vendor_categories_df.alias("c"),
+            (col("l.vendor_name") == col("c.vendor_name"))
+            & (col("l.vendor_category_id") == col("c.category_id")),
+            how="left",
+        )
+    )
+
+    print(
+        "[INFO] links_with_cat_df rows after join: "
+        f"{links_with_cat_df.count()}"
+    )
+
+    # Build the mapping struct in the exact format requested:
+    # "vendor_mappings": [
+    #   {
+    #     "vendor_short_name": vendor_products.vendor_name,
+    #     "vendor_category_id": product_category_links.vendor_category_id,
+    #     "vendor_category_name": vendor_categories.category_name,
+    #     "vendor_category_path": vendor_categories.category_path,
+    #     "vendor_category_type": vendor_categories.type
+    #   }
+    # ]
+    mapping_struct_col = struct(
+        col("l.vendor_name").alias("vendor_short_name"),
+        col("l.vendor_category_id").alias("vendor_category_id"),
+        col("c.category_name").alias("vendor_category_name"),
+        col("c.category_path").alias("vendor_category_path"),
+        col("c.type").alias("vendor_category_type"),
+    ).alias("mapping")
+
+    # Only keep combinations where we actually have a vendor_category_id
+    mappings_df = (
+        links_with_cat_df.where(col("l.vendor_category_id").isNotNull())
+        .select(
+            col("l.vendor_name").alias("vendor_name"),
+            col("l.article_id").alias("article_id"),
+            mapping_struct_col,
+        )
+    )
+
+    print(
+        f"[INFO] mappings_df rows (article/category combinations): "
+        f"{mappings_df.count()}"
+    )
+
+    # Aggregate mappings per (vendor_name, article_id) into vendor_mappings array
+    aggregated_mappings_df = (
+        mappings_df.groupBy("vendor_name", "article_id")
+        .agg(collect_list("mapping").alias("vendor_mappings"))
+    )
+
+    print(
+        "[INFO] aggregated_mappings_df rows (distinct vendor_name/article_id): "
+        f"{aggregated_mappings_df.count()}"
+    )
+
+    # -------------------------
+    # 3) Extend vendor_products with vendor_mappings
+    # -------------------------
+    # "rest of the product record is taken over from vendor_products as is"
+    extended_products_df = (
+        vendor_products_df.alias("p")
+        .join(
+            aggregated_mappings_df.alias("m"),
+            on=["vendor_name", "article_id"],
+            how="left",
+        )
+    )
+
+    print(f"[INFO] extended_products_df rows: {extended_products_df.count()}")
+
+    # -------------------------
+    # 4) Write NDJSON output to prepared_output_prefix
+    # -------------------------
+    timestamp_part1 = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+    # Temporary prefix in OUTPUT_BUCKET to handle coalesce(1)
+    tmp_key_prefix_part1 = (
+        f"{prepared_output_prefix.rstrip('/')}/"
+        f"_tmp_{vendor_name}_forMapping_products_{timestamp_part1}/"
+    )
+    tmp_uri_part1 = f"s3://{output_bucket}/{tmp_key_prefix_part1}"
+
+    print(f"[INFO] Writing PART-1 NDJSON to temporary prefix: {tmp_uri_part1}")
+
+    (
+        extended_products_df.toJSON()  # 1 JSON object per line
+        .coalesce(1)  # single output part file
+        .saveAsTextFile(tmp_uri_part1)
+    )
+
+    # Locate the part file
+    tmp_keys_part1 = list_s3_objects(output_bucket, tmp_key_prefix_part1)
+    part_keys_part1 = [k for k in tmp_keys_part1 if "/part-" in k]
+
+    if not part_keys_part1:
+        raise RuntimeError(
+            f"No part files found in temporary output prefix '{tmp_key_prefix_part1}'"
+        )
+
+    part_keys_part1.sort()
+    part_key_part1 = part_keys_part1[0]
+    print(
+        f"[INFO] Selected PART-1 part file: s3://{output_bucket}/{part_key_part1}"
+    )
+
+    # Final key EXACTLY as previously used: <VENDOR_NAME>_forMapping_products
+    final_key = f"{prepared_output_prefix.rstrip('/')}/{vendor_name}_forMapping_products"
+    print(f"[INFO] Copying PART-1 result to final output: s3://{output_bucket}/{final_key}")
+
+    # Copy part file to final key
+    s3_client.copy_object(
+        Bucket=output_bucket,
+        CopySource={"Bucket": output_bucket, "Key": part_key_part1},
+        Key=final_key,
+    )
+
+    # Cleanup temporary folder
+    print(f"[INFO] Cleaning up PART-1 temporary prefix: {tmp_key_prefix_part1}")
+    for k in tmp_keys_part1:
+        s3_client.delete_object(Bucket=output_bucket, Key=k)
+
+    # =========================================================
+    # PART-2: enrich with existing canonical mappings
+    # =========================================================
+    print("[INFO] ===== PART-2: Enriching with existing category mappings =====")
+
+    for_mapping_uri = f"s3://{output_bucket}/{final_key}"
+    print(f"[INFO] Reading for-mapping products from: {for_mapping_uri}")
+
+    # This is NDJSON (one JSON per line), so standard read.json works
+    for_mapping_df = spark.read.json(for_mapping_uri)
+    print(f"[INFO] Loaded for_mapping_df with {for_mapping_df.count()} rows")
+
+    mapping_ref_df = None  # will stay None if no mapping reference exists
+
+    # Try to find latest Category_Mapping_Reference_<timestamp>.json.
+    # If none exists, we still add empty columns but do NOT fail the job.
+    try:
+        mapping_ref_key = select_latest_category_mapping_key(input_bucket)
+        mapping_ref_uri = f"s3://{input_bucket}/{mapping_ref_key}"
+        print(f"[INFO] Reading Category Mapping Reference from: {mapping_ref_uri}")
+
+        # The reference file is a normal JSON file with objects containing:
+        # pim_category_id, pim_category_name, vendor_mappings[], mapping_methods[]
+        # We enable multiLine to be robust against pretty-printed JSON.
+        mapping_ref_df = (
+            spark.read.option("multiLine", True).json(mapping_ref_uri)
+        )
+
+        print(
+            "[INFO] Loaded mapping_ref_df with "
+            f"{mapping_ref_df.count()} rows (PIM categories)"
+        )
+
+        # Flatten vendor_mappings array so we have one row per (vendor_short_name, vendor_category_id)
+        mapping_flat_df = (
+            mapping_ref_df.select(
+                explode_outer("vendor_mappings").alias("vm"),
+                col("pim_category_id"),
+                col("pim_category_name"),
+            )
+            .where(col("vm").isNotNull())
+            .select(
+                col("vm.vendor_short_name").alias("vendor_short_name"),
+                col("vm.vendor_category_id").alias("vendor_category_id"),
+                col("pim_category_id"),
+                col("pim_category_name"),
+            )
+        )
+
+        print(
+            "[INFO] mapping_flat_df rows (vendor-category to PIM mappings): "
+            f"{mapping_flat_df.count()}"
+        )
+
+        # If there are no rows for this vendor, mapping_flat_df may be empty;
+        # we handle that gracefully.
+        if mapping_flat_df.rdd.isEmpty():
+            print(
+                "[WARN] mapping_flat_df is empty (no vendor/category mappings found "
+                "in reference); products will get empty PIM fields."
+            )
+            enriched_df = (
+                for_mapping_df.withColumn("pim_category_id", lit(None).cast("string"))
+                .withColumn("pim_category_name", lit(None).cast("string"))
+                .withColumn("assignment_source", lit(None).cast("string"))
+                .withColumn("assignment_confidence", lit(None).cast("string"))
+            )
+        else:
+            # Explode vendor_mappings in products to (vendor_name, article_id, vendor_short_name, vendor_category_id)
+            products_exploded_df = (
+                for_mapping_df.select(
+                    col("vendor_name"),
+                    col("article_id"),
+                    col("vendor_mappings"),
+                    explode_outer("vendor_mappings").alias("vm"),
+                )
+            )
+
+            print(
+                "[INFO] products_exploded_df rows (vendor-mapping combinations): "
+                f"{products_exploded_df.count()}"
+            )
+
+            # Join exploded products with mapping_flat_df on vendor_short_name + vendor_category_id
+            joined_df = (
+                products_exploded_df.join(
+                    mapping_flat_df,
+                    (
+                        col("vm.vendor_short_name")
+                        == col("vendor_short_name")
+                    )
+                    & (
+                        col("vm.vendor_category_id")
+                        == col("vendor_category_id")
+                    ),
+                    how="left",
+                )
+            )
+
+            print(
+                "[INFO] joined_df rows after join to mapping_flat_df: "
+                f"{joined_df.count()}"
+            )
+
+            # For each product (vendor_name, article_id), pick first matching PIM category
+            product_pim_df = (
+                joined_df.groupBy("vendor_name", "article_id")
+                .agg(
+                    first("pim_category_id", ignorenulls=True).alias(
+                        "pim_category_id"
+                    ),
+                    first("pim_category_name", ignorenulls=True).alias(
+                        "pim_category_name"
+                    ),
+                )
+            )
+
+            print(
+                "[INFO] product_pim_df rows (products with possible PIM mapping): "
+                f"{product_pim_df.count()}"
+            )
+
+            # Join back to full product records, keep vendor_mappings as in Part-1
+            enriched_df = (
+                for_mapping_df.alias("p")
+                .join(
+                    product_pim_df.alias("pm"),
+                    on=["vendor_name", "article_id"],
+                    how="left",
+                )
+            )
+
+            # Add assignment_source and assignment_confidence only if we have a PIM mapping
+            enriched_df = (
+                enriched_df
+                .withColumn(
+                    "assignment_source",
+                    when(
+                        col("pim_category_id").isNotNull(),
+                        lit("existing_category_match")
+                    ).otherwise(lit(None).cast("string"))
+                )
+                .withColumn(
+                    "assignment_confidence",
+                    when(
+                        col("pim_category_id").isNotNull(),
+                        lit("full")
+                    ).otherwise(lit(None).cast("string"))
+                )
+            )
+
+    except RuntimeError as e:
+        # No Category_Mapping_Reference file found – do NOT fail the job, just add empty columns
+        print(
+            "[WARN] No Category_Mapping_Reference file found; "
+            "products will get empty PIM fields. Details: "
+            f"{e}"
+        )
+        enriched_df = (
+            for_mapping_df.withColumn("pim_category_id", lit(None).cast("string"))
+            .withColumn("pim_category_name", lit(None).cast("string"))
+            .withColumn("assignment_source", lit(None).cast("string"))
+            .withColumn("assignment_confidence", lit(None).cast("string"))
+        )
+
+    print(f"[INFO] enriched_df rows (post PART-2 products): {enriched_df.count()}")
+
+    # =========================================================
+    # PART-3: description_short-based matching for unmapped products
+    # =========================================================
+    print("[INFO] ===== PART-3: DESCRIPTION_SHORT-based matching for unmapped products =====")
+
+    if mapping_ref_df is None:
+        print("[WARN] mapping_ref_df is None; skipping PART-3 (no mapping_methods available).")
+        part3_df = enriched_df
+    else:
+        # Build a small lookup structure for DESCRIPTION_SHORT mapping_methods on the driver
+        mapping_records = (
+            mapping_ref_df
+            .select("pim_category_id", "pim_category_name", "mapping_methods")
+            .collect()
+        )
+
+        mapping_methods_lookup_ds = []
+
+        for row in mapping_records:
+            pim_id = row["pim_category_id"]
+            pim_name = row["pim_category_name"]
+            methods = row["mapping_methods"] or []
+
+            # Only keep methods with field_name == "DESCRIPTION_SHORT"
+            ds_methods = []
+            for m in methods:
+                if m is None:
+                    continue
+                field_name = (m.get("field_name") if isinstance(m, dict) else m["field_name"])
+                if field_name == "DESCRIPTION_SHORT":
+                    op = (m.get("operator") if isinstance(m, dict) else m["operator"])
+                    values_include = (m.get("values_include") if isinstance(m, dict) else m["values_include"])
+                    values_exclude = (m.get("values_exclude") if isinstance(m, dict) else m["values_exclude"])
+                    ds_methods.append({
+                        "operator": op,
+                        "values_include": values_include,
+                        "values_exclude": values_exclude,
+                    })
+
+            if ds_methods:
+                mapping_methods_lookup_ds.append({
+                    "pim_category_id": pim_id,
+                    "pim_category_name": pim_name,
+                    "methods": ds_methods,
+                })
+
+        if not mapping_methods_lookup_ds:
+            print("[WARN] No DESCRIPTION_SHORT mapping_methods found; skipping PART-3.")
+            part3_df = enriched_df
+        else:
+            print(f"[INFO] Found DESCRIPTION_SHORT mapping_methods for {len(mapping_methods_lookup_ds)} PIM categories.")
+
+            # Prepare Python-side evaluator for operators (DESCRIPTION_SHORT)
+            def method_matches_description(text: str, method: dict) -> bool:
+                if text is None:
+                    return False
+                text_l = text.lower()
+
+                op = (method.get("operator") or "").lower()
+                inc = method.get("values_include") or []
+                exc = method.get("values_exclude") or []
+
+                inc = [str(x).lower() for x in inc if x is not None]
+                exc = [str(x).lower() for x in exc if x is not None]
+
+                def contains_any(tokens):
+                    return any(t in text_l for t in tokens) if tokens else False
+
+                def contains_all(tokens):
+                    return all(t in text_l for t in tokens) if tokens else False
+
+                def has_any(tokens):
+                    return any(t in text_l for t in tokens) if tokens else False
+
+                def has_all(tokens):
+                    return all(t in text_l for t in tokens) if tokens else False
+
+                if op == "contains_any":
+                    return contains_any(inc)
+
+                elif op == "contains_all":
+                    return contains_all(inc) if inc else False
+
+                elif op == "contains_any_exclude_any":
+                    if not contains_any(inc):
+                        return False
+                    return not has_any(exc)
+
+                elif op == "contains_any_exclude_all":
+                    if not contains_any(inc):
+                        return False
+                    if not exc:
+                        return True
+                    return not has_all(exc)
+
+                elif op == "contains_all_exclude_any":
+                    if not contains_all(inc):
+                        return False
+                    return not has_any(exc)
+
+                elif op == "contains_all_exclude_all":
+                    if not contains_all(inc):
+                        return False
+                    if not exc:
+                        return True
+                    return not has_all(exc)
+
+                elif op == "starts_with":
+                    if not inc:
+                        return False
+                    return any(text_l.startswith(t) for t in inc)
+
+                else:
+                    return False
+
+            result_schema_ds = StructType([
+                StructField("pim_category_id_ds", StringType(), True),
+                StructField("pim_category_name_ds", StringType(), True),
+                StructField("assignment_source_ds", StringType(), True),
+                StructField("assignment_confidence_ds", StringType(), True),
+            ])
+
+            def evaluate_description_short(description_short: str, assignment_source: str):
+                """
+                For a given product:
+                  - If assignment_source is already 'existing_category_match' => do nothing.
+                  - Otherwise evaluate DESCRIPTION_SHORT mapping_methods.
+                """
+                if assignment_source == "existing_category_match":
+                    return (None, None, None, None)
+
+                text = description_short or ""
+                if not text:
+                    return (None, None, None, None)
+
+                cat_counts = {}  # pim_id -> (count, pim_name)
+                for entry in mapping_methods_lookup_ds:
+                    pim_id = entry["pim_category_id"]
+                    pim_name = entry["pim_category_name"]
+                    methods = entry["methods"]
+
+                    count = 0
+                    for m in methods:
+                        if method_matches_description(text, m):
+                            count += 1
+
+                    if count > 0:
+                        cat_counts[pim_id] = (count, pim_name)
+
+                if not cat_counts:
+                    return (None, None, None, None)
+
+                if len(cat_counts) == 1:
+                    pim_id, (count, pim_name) = next(iter(cat_counts.items()))
+                    conf_str = str(count)
+                    return (pim_id, pim_name, "description_short_match", conf_str)
+
+                pim_ids_sorted = sorted(cat_counts.keys())
+                pim_names_sorted = [cat_counts[p][1] for p in pim_ids_sorted]
+                pim_id_str = "|".join(pim_ids_sorted)
+                pim_name_str = "|".join(pim_names_sorted)
+                return (pim_id_str, pim_name_str, "description_short_match", "mixed")
+
+            ds_udf = udf(evaluate_description_short, result_schema_ds)
+
+            with_ds_df = enriched_df.withColumn(
+                "ds_result",
+                ds_udf(col("description_short"), col("assignment_source"))
+            )
+
+            part3_df = (
+                with_ds_df
+                .withColumn(
+                    "pim_category_id",
+                    when(
+                        col("assignment_source") == "existing_category_match",
+                        col("pim_category_id")
+                    ).otherwise(
+                        when(
+                            col("ds_result.assignment_source_ds").isNotNull(),
+                            col("ds_result.pim_category_id_ds")
+                        ).otherwise(col("pim_category_id"))
+                    )
+                )
+                .withColumn(
+                    "pim_category_name",
+                    when(
+                        col("assignment_source") == "existing_category_match",
+                        col("pim_category_name")
+                    ).otherwise(
+                        when(
+                            col("ds_result.assignment_source_ds").isNotNull(),
+                            col("ds_result.pim_category_name_ds")
+                        ).otherwise(col("pim_category_name"))
+                    )
+                )
+                .withColumn(
+                    "assignment_source",
+                    when(
+                        col("assignment_source") == "existing_category_match",
+                        col("assignment_source")
+                    ).otherwise(
+                        when(
+                            col("ds_result.assignment_source_ds").isNotNull(),
+                            col("ds_result.assignment_source_ds")
+                        ).otherwise(col("assignment_source"))
+                    )
+                )
+                .withColumn(
+                    "assignment_confidence",
+                    when(
+                        col("assignment_source") == "existing_category_match",
+                        col("assignment_confidence")
+                    ).otherwise(
+                        when(
+                            col("ds_result.assignment_source_ds").isNotNull(),
+                            col("ds_result.assignment_confidence_ds")
+                        ).otherwise(col("assignment_confidence"))
+                    )
+                )
+                .drop("ds_result")
+            )
+
+    print(f"[INFO] part3_df rows (after PART-3): {part3_df.count()}")
+
+    # =========================================================
+    # PART-4: KEYWORD-based matching & combination with DESCRIPTION
+    # =========================================================
+    print("[INFO] ===== PART-4: KEYWORD-based matching =====")
+
+    if mapping_ref_df is None:
+        print("[WARN] mapping_ref_df is None; skipping PART-4 (no mapping_methods available).")
+        final_df = part3_df
+    else:
+        # Build lookup for KEYWORD mapping_methods
+        mapping_records_kw = (
+            mapping_ref_df
+            .select("pim_category_id", "pim_category_name", "mapping_methods")
+            .collect()
+        )
+
+        mapping_methods_lookup_kw = []
+
+        for row in mapping_records_kw:
+            pim_id = row["pim_category_id"]
+            pim_name = row["pim_category_name"]
+            methods = row["mapping_methods"] or []
+
+            kw_methods = []
+            for m in methods:
+                if m is None:
+                    continue
+                field_name = (m.get("field_name") if isinstance(m, dict) else m["field_name"])
+                if field_name == "KEYWORD":
+                    op = (m.get("operator") if isinstance(m, dict) else m["operator"])
+                    values_include = (m.get("values_include") if isinstance(m, dict) else m["values_include"])
+                    values_exclude = (m.get("values_exclude") if isinstance(m, dict) else m["values_exclude"])
+                    kw_methods.append({
+                        "operator": op,
+                        "values_include": values_include,
+                        "values_exclude": values_exclude,
+                    })
+
+            if kw_methods:
+                mapping_methods_lookup_kw.append({
+                    "pim_category_id": pim_id,
+                    "pim_category_name": pim_name,
+                    "methods": kw_methods,
+                })
+
+        if not mapping_methods_lookup_kw:
+            print("[WARN] No KEYWORD mapping_methods found; skipping PART-4.")
+            final_df = part3_df
+        else:
+            print(f"[INFO] Found KEYWORD mapping_methods for {len(mapping_methods_lookup_kw)} PIM categories.")
+
+            # Operator evaluator on list of keywords
+            def method_matches_keywords(keywords, method: dict) -> bool:
+                if not keywords:
+                    return False
+
+                kw_list = [str(k).lower() for k in keywords if k is not None]
+
+                op = (method.get("operator") or "").lower()
+                inc = method.get("values_include") or []
+                exc = method.get("values_exclude") or []
+
+                inc = [str(x).lower() for x in inc if x is not None]
+                exc = [str(x).lower() for x in exc if x is not None]
+
+                def contains_any(tokens):
+                    return any(
+                        t in kw
+                        for kw in kw_list
+                        for t in tokens
+                    ) if tokens else False
+
+                def contains_all(tokens):
+                    if not tokens:
+                        return False
+                    return all(
+                        any(t in kw for kw in kw_list)
+                        for t in tokens
+                    )
+
+                def has_any(tokens):
+                    return any(
+                        t in kw
+                        for kw in kw_list
+                        for t in tokens
+                    ) if tokens else False
+
+                def has_all(tokens):
+                    if not tokens:
+                        return False
+                    return all(
+                        any(t in kw for kw in kw_list)
+                        for t in tokens
+                    )
+
+                if op == "contains_any":
+                    return contains_any(inc)
+
+                elif op == "contains_all":
+                    return contains_all(inc)
+
+                elif op == "contains_any_exclude_any":
+                    if not contains_any(inc):
+                        return False
+                    return not has_any(exc)
+
+                elif op == "contains_any_exclude_all":
+                    if not contains_any(inc):
+                        return False
+                    if not exc:
+                        return True
+                    return not has_all(exc)
+
+                elif op == "contains_all_exclude_any":
+                    if not contains_all(inc):
+                        return False
+                    return not has_any(exc)
+
+                elif op == "contains_all_exclude_all":
+                    if not contains_all(inc):
+                        return False
+                    if not exc:
+                        return True
+                    return not has_all(exc)
+
+                elif op == "starts_with":
+                    if not inc:
+                        return False
+                    return any(
+                        any(kw.startswith(t) for kw in kw_list)
+                        for t in inc
+                    )
+
+                else:
+                    return False
+
+            result_schema_kw = StructType([
+                StructField("pim_category_id_kw", StringType(), True),
+                StructField("pim_category_name_kw", StringType(), True),
+                StructField("assignment_source_kw", StringType(), True),
+                StructField("assignment_confidence_kw", StringType(), True),
+            ])
+
+            def evaluate_keyword(
+                keywords,
+                assignment_source,
+                assignment_confidence,
+                pim_category_id,
+                pim_category_name,
+            ):
+                # Do not touch existing_category_match
+                if assignment_source == "existing_category_match":
+                    return (None, None, None, None)
+
+                kw_list = keywords or []
+                if not kw_list:
+                    return (None, None, None, None)
+
+                # Compute match_count per PIM category based on KEYWORD methods
+                cat_counts = {}  # pim_id -> (count, pim_name)
+                for entry in mapping_methods_lookup_kw:
+                    pim_id = entry["pim_category_id"]
+                    pim_name = entry["pim_category_name"]
+                    methods = entry["methods"]
+
+                    count = 0
+                    for m in methods:
+                        if method_matches_keywords(kw_list, m):
+                            count += 1
+
+                    if count > 0:
+                        cat_counts[pim_id] = (count, pim_name)
+
+                if not cat_counts:
+                    return (None, None, None, None)
+
+                # Parse existing DESCRIPTION mapping (if any)
+                current_ids = []
+                if pim_category_id:
+                    current_ids = [x for x in pim_category_id.split("|") if x]
+
+                has_description = (assignment_source == "description_short_match") and bool(current_ids)
+
+                # --- Case 1: no description-based assignment yet => keyword-only (r1, r2, r5)
+                if not has_description:
+                    if len(cat_counts) == 1:
+                        pim_id, (count, pim_name) = next(iter(cat_counts.items()))
+                        conf_str = str(count)  # number of KEYWORD methods
+                        return (pim_id, pim_name, "keyword_match", conf_str)
+                    else:
+                        pim_ids_sorted = sorted(cat_counts.keys())
+                        pim_names_sorted = [cat_counts[p][1] for p in pim_ids_sorted]
+                        pim_id_str = "|".join(pim_ids_sorted)
+                        pim_name_str = "|".join(pim_names_sorted)
+                        return (pim_id_str, pim_name_str, "keyword_match", "mixed")
+
+                # --- Case 2: description_short_match already exists => combine (r3, r4, r6, r7)
+                # current_ids: DESCRIPTION categories
+                # assignment_confidence: DESCRIPTION confidence (numeric or "mixed")
+                desc_ids = current_ids
+                desc_names_list = (pim_category_name or "").split("|") if pim_category_name else []
+                desc_id_to_name = {}
+                for pid, pname in zip(desc_ids, desc_names_list):
+                    desc_id_to_name[pid] = pname
+
+                # Determine if DESCRIPTION is single-category or multi-category
+                desc_single = len(desc_ids) == 1
+                desc_conf_numeric = False
+                desc_conf_val = 0
+                try:
+                    if assignment_confidence is not None:
+                        desc_conf_val = int(assignment_confidence)
+                        desc_conf_numeric = True
+                except Exception:
+                    desc_conf_numeric = False
+
+                # Only one KEYWORD category matched
+                if len(cat_counts) == 1:
+                    kw_id, (kw_count, kw_name) = next(iter(cat_counts.items()))
+
+                    if desc_single:
+                        ds_id = desc_ids[0]
+                        ds_name = desc_id_to_name.get(ds_id, pim_category_name)
+
+                        if kw_id == ds_id:
+                            # r3/r4: same PIM category; add counts
+                            total_count = kw_count
+                            if desc_conf_numeric:
+                                total_count += desc_conf_val
+                            # if DESCRIPTION conf was "mixed", not expected here; fall back to kw_count
+                            conf_str = str(total_count)
+                            return (
+                                ds_id,
+                                ds_name,
+                                "description_and_keyword_match",
+                                conf_str,
+                            )
+                        else:
+                            # DESCRIPTION -> A, KEYWORD -> B => union {A,B}, mixed
+                            union_ids = set(desc_ids)
+                            union_ids.add(kw_id)
+                            id_to_name = dict(desc_id_to_name)
+                            id_to_name[kw_id] = kw_name
+                            ordered_ids = sorted(union_ids)
+                            ordered_names = [id_to_name[i] for i in ordered_ids]
+                            return (
+                                "|".join(ordered_ids),
+                                "|".join(ordered_names),
+                                "description_and_keyword_match",
+                                "mixed",
+                            )
+                    else:
+                        # DESCRIPTION already multi-category; union with KW category
+                        union_ids = set(desc_ids)
+                        union_ids.add(kw_id)
+                        id_to_name = dict(desc_id_to_name)
+                        id_to_name[kw_id] = kw_name
+                        ordered_ids = sorted(union_ids)
+                        ordered_names = [id_to_name[i] for i in ordered_ids]
+                        return (
+                            "|".join(ordered_ids),
+                            "|".join(ordered_names),
+                            "description_and_keyword_match",
+                            "mixed",
+                        )
+
+                # Multiple KEYWORD categories matched
+                # r6 / r7: union DESCRIPTION + KEYWORD categories, mixed
+                union_ids = set(desc_ids)
+                id_to_name = dict(desc_id_to_name)
+
+                for pid, (kw_count, kw_name) in cat_counts.items():
+                    union_ids.add(pid)
+                    id_to_name[pid] = kw_name
+
+                ordered_ids = sorted(union_ids)
+                ordered_names = [id_to_name[i] for i in ordered_ids]
+
+                return (
+                    "|".join(ordered_ids),
+                    "|".join(ordered_names),
+                    "description_and_keyword_match",
+                    "mixed",
+                )
+
+            kw_udf = udf(
+                evaluate_keyword,
+                result_schema_kw
+            )
+
+            with_kw_df = part3_df.withColumn(
+                "kw_result",
+                kw_udf(
+                    col("keywords"),
+                    col("assignment_source"),
+                    col("assignment_confidence"),
+                    col("pim_category_id"),
+                    col("pim_category_name"),
+                ),
+            )
+
+            final_df = (
+                with_kw_df
+                .withColumn(
+                    "pim_category_id",
+                    when(
+                        col("assignment_source") == "existing_category_match",
+                        col("pim_category_id")
+                    ).otherwise(
+                        when(
+                            col("kw_result.assignment_source_kw").isNotNull(),
+                            col("kw_result.pim_category_id_kw")
+                        ).otherwise(col("pim_category_id"))
+                    )
+                )
+                .withColumn(
+                    "pim_category_name",
+                    when(
+                        col("assignment_source") == "existing_category_match",
+                        col("pim_category_name")
+                    ).otherwise(
+                        when(
+                            col("kw_result.assignment_source_kw").isNotNull(),
+                            col("kw_result.pim_category_name_kw")
+                        ).otherwise(col("pim_category_name"))
+                    )
+                )
+                .withColumn(
+                    "assignment_source",
+                    when(
+                        col("assignment_source") == "existing_category_match",
+                        col("assignment_source")
+                    ).otherwise(
+                        when(
+                            col("kw_result.assignment_source_kw").isNotNull(),
+                            col("kw_result.assignment_source_kw")
+                        ).otherwise(col("assignment_source"))
+                    )
+                )
+                .withColumn(
+                    "assignment_confidence",
+                    when(
+                        col("assignment_source") == "existing_category_match",
+                        col("assignment_confidence")
+                    ).otherwise(
+                        when(
+                            col("kw_result.assignment_source_kw").isNotNull(),
+                            col("kw_result.assignment_confidence_kw")
+                        ).otherwise(col("assignment_confidence"))
+                    )
+                )
+                .drop("kw_result")
+            )
+
+    print(f"[INFO] final_df rows (after PART-4): {final_df.count()}")
+
+    # -------------------------
+    # Write FINAL result back to SAME final_key (overwrite)
+    # -------------------------
+    timestamp_part4 = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+
+    tmp_key_prefix_part4 = (
+        f"{prepared_output_prefix.rstrip('/')}/"
+        f"_tmp_{vendor_name}_forMapping_products_enriched_part4_{timestamp_part4}/"
+    )
+    tmp_uri_part4 = f"s3://{output_bucket}/{tmp_key_prefix_part4}"
+
+    print(f"[INFO] Writing FINAL NDJSON (after PART-4) to temporary prefix: {tmp_uri_part4}")
+
+    (
+        final_df.toJSON()  # 1 JSON object per line
+        .coalesce(1)  # single output part file
+        .saveAsTextFile(tmp_uri_part4)
+    )
+
+    tmp_keys_part4 = list_s3_objects(output_bucket, tmp_key_prefix_part4)
+    part_keys_part4 = [k for k in tmp_keys_part4 if "/part-" in k]
+
+    if not part_keys_part4:
+        raise RuntimeError(
+            f"No part files found in PART-4 temporary output prefix '{tmp_key_prefix_part4}'"
+        )
+
+    part_keys_part4.sort()
+    part_key_part4 = part_keys_part4[0]
+    print(
+        f"[INFO] Selected PART-4 part file: s3://{output_bucket}/{part_key_part4}"
+    )
+
+    print(
+        f"[INFO] Copying FINAL result (overwriting) to final output: "
+        f"s3://{output_bucket}/{final_key}"
+    )
+
+    s3_client.copy_object(
+        Bucket=output_bucket,
+        CopySource={"Bucket": output_bucket, "Key": part_key_part4},
+        Key=final_key,
+    )
+
+    print(f"[INFO] Cleaning up PART-4 temporary prefix: {tmp_key_prefix_part4}")
+    for k in tmp_keys_part4:
+        s3_client.delete_object(Bucket=output_bucket, Key=k)
+
+    print("[INFO] Job completed successfully (Part-1 + Part-2 + Part-3 + Part-4).")
+    job.commit()
+
+except Exception as e:
+    print(f"[ERROR] Job failed: {e}")
+    job.commit()
+    raise
