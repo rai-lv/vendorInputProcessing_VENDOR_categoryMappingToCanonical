@@ -1,6 +1,8 @@
 import sys
 import os
+import re
 from datetime import datetime, timezone
+from typing import List, Set
 
 import boto3
 from botocore.exceptions import ClientError
@@ -24,6 +26,133 @@ from pyspark.sql.types import StructType, StructField, StringType
 from pyspark.sql.functions import udf
 
 # ---------- Helpers ----------
+
+
+GERMAN_CHAR_MAP = str.maketrans({
+    "ä": "ae",
+    "Ä": "ae",
+    "ö": "oe",
+    "Ö": "oe",
+    "ü": "ue",
+    "Ü": "ue",
+    "ß": "ss",
+})
+
+
+def normalize_german_chars(text: str) -> str:
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
+    return text.translate(GERMAN_CHAR_MAP).lower()
+
+
+STOPWORDS_DE_V1 = [
+    "und",
+    "oder",
+    "aber",
+    "den",
+    "der",
+    "die",
+    "das",
+    "des",
+    "dem",
+    "ein",
+    "eine",
+    "einem",
+    "einen",
+    "einer",
+    "im",
+    "in",
+    "aus",
+    "auf",
+    "mit",
+    "von",
+    "vom",
+    "zum",
+    "zur",
+    "am",
+    "an",
+    "für",
+    "ohne",
+    "auch",
+    "ist",
+    "sind",
+    "sein",
+    "bei",
+    "dass",
+    "wie",
+    "als",
+    "so",
+    "noch",
+]
+
+
+def build_stopword_set() -> Set[str]:
+    return {normalize_german_chars(w) for w in STOPWORDS_DE_V1 if w}
+
+
+TOKEN_PATTERN = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+TRIM_PATTERN = re.compile(r"^[^a-z0-9]+|[^a-z0-9]+$", re.IGNORECASE)
+
+MIN_TOKEN_LENGTH = 2
+DROP_NUMERIC_ONLY_FIELDS = {"DESCRIPTION_SHORT", "KEYWORD"}
+
+
+def tokenize_text_value(value, field_name: str, stopwords: Set[str]) -> List[str]:
+    tokens: List[str] = []
+    if value is None:
+        return tokens
+    if not isinstance(value, str):
+        value = str(value)
+
+    normalized = normalize_german_chars(value)
+    normalized = TRIM_PATTERN.sub(" ", normalized)
+
+    for m in TOKEN_PATTERN.finditer(normalized):
+        tok = m.group(0)
+        tok = tok.strip("._-")
+        if len(tok) < MIN_TOKEN_LENGTH:
+            continue
+        if field_name in DROP_NUMERIC_ONLY_FIELDS and tok.isnumeric():
+            continue
+        if tok in stopwords:
+            continue
+        tokens.append(tok)
+
+    return tokens
+
+
+def tokenize_keywords(keywords, stopwords: Set[str]) -> List[str]:
+    all_tokens: List[str] = []
+    if not keywords:
+        return all_tokens
+
+    for kw in keywords:
+        all_tokens.extend(tokenize_text_value(kw, "KEYWORD", stopwords))
+
+    return all_tokens
+
+
+def tokenize_description(description_short, stopwords: Set[str]) -> List[str]:
+    return tokenize_text_value(description_short, "DESCRIPTION_SHORT", stopwords)
+
+
+def normalize_rule_tokens(values, field_name: str, stopwords: Set[str]) -> List[str]:
+    """
+    Turn mapping_method values into normalized tokens using the SAME tokenization rules.
+    This intentionally supports older/manual rule values like 'Akku-Bohrer' by splitting it.
+    """
+    tokens: List[str] = []
+    if not values:
+        return tokens
+    for v in values:
+        if v is None:
+            continue
+        if not isinstance(v, str):
+            v = str(v)
+        tokens.extend(tokenize_text_value(v, field_name, stopwords))
+    return tokens
 
 
 def ensure_prefix_uri(uri: str) -> str:
@@ -147,6 +276,7 @@ job = Job(glue_context)
 job.init(job_name, args)
 
 s3_client = boto3.client("s3")
+stopwords_for_filtering = build_stopword_set()
 
 try:
     # =========================================================
@@ -569,61 +699,68 @@ try:
             def method_matches_description(text: str, method: dict) -> bool:
                 if text is None:
                     return False
-                text_l = text.lower()
+
+                text_tokens = set(tokenize_description(text, stopwords_for_filtering))
 
                 op = (method.get("operator") or "").lower()
-                inc = method.get("values_include") or []
-                exc = method.get("values_exclude") or []
-
-                inc = [str(x).lower() for x in inc if x is not None]
-                exc = [str(x).lower() for x in exc if x is not None]
+                inc_tokens = normalize_rule_tokens(
+                    method.get("values_include") or [],
+                    "DESCRIPTION_SHORT",
+                    stopwords_for_filtering,
+                )
+                exc_tokens = normalize_rule_tokens(
+                    method.get("values_exclude") or [],
+                    "DESCRIPTION_SHORT",
+                    stopwords_for_filtering,
+                )
 
                 def contains_any(tokens):
-                    return any(t in text_l for t in tokens) if tokens else False
+                    return bool(tokens) and any(t in text_tokens for t in tokens)
 
                 def contains_all(tokens):
-                    return all(t in text_l for t in tokens) if tokens else False
+                    return bool(tokens) and all(t in text_tokens for t in tokens)
 
                 def has_any(tokens):
-                    return any(t in text_l for t in tokens) if tokens else False
+                    return bool(tokens) and any(t in text_tokens for t in tokens)
 
                 def has_all(tokens):
-                    return all(t in text_l for t in tokens) if tokens else False
+                    return bool(tokens) and all(t in text_tokens for t in tokens)
 
                 if op == "contains_any":
-                    return contains_any(inc)
+                    return contains_any(inc_tokens)
 
                 elif op == "contains_all":
-                    return contains_all(inc) if inc else False
+                    return contains_all(inc_tokens)
 
                 elif op == "contains_any_exclude_any":
-                    if not contains_any(inc):
+                    if not contains_any(inc_tokens):
                         return False
-                    return not has_any(exc)
+                    return not has_any(exc_tokens)
 
                 elif op == "contains_any_exclude_all":
-                    if not contains_any(inc):
+                    if not contains_any(inc_tokens):
                         return False
-                    if not exc:
+                    if not exc_tokens:
                         return True
-                    return not has_all(exc)
+                    return not has_all(exc_tokens)
 
                 elif op == "contains_all_exclude_any":
-                    if not contains_all(inc):
+                    if not contains_all(inc_tokens):
                         return False
-                    return not has_any(exc)
+                    return not has_any(exc_tokens)
 
                 elif op == "contains_all_exclude_all":
-                    if not contains_all(inc):
+                    if not contains_all(inc_tokens):
                         return False
-                    if not exc:
+                    if not exc_tokens:
                         return True
-                    return not has_all(exc)
+                    return not has_all(exc_tokens)
 
                 elif op == "starts_with":
-                    if not inc:
+                    if not inc_tokens:
                         return False
-                    return any(text_l.startswith(t) for t in inc)
+                    normalized_text = normalize_german_chars(text)
+                    return any(normalized_text.startswith(t) for t in inc_tokens)
 
                 else:
                     return False
@@ -794,81 +931,69 @@ try:
                 if not keywords:
                     return False
 
-                kw_list = [str(k).lower() for k in keywords if k is not None]
+                kw_tokens = set(tokenize_keywords(keywords, stopwords_for_filtering))
 
                 op = (method.get("operator") or "").lower()
-                inc = method.get("values_include") or []
-                exc = method.get("values_exclude") or []
-
-                inc = [str(x).lower() for x in inc if x is not None]
-                exc = [str(x).lower() for x in exc if x is not None]
+                inc_tokens = normalize_rule_tokens(
+                    method.get("values_include") or [],
+                    "KEYWORD",
+                    stopwords_for_filtering,
+                )
+                exc_tokens = normalize_rule_tokens(
+                    method.get("values_exclude") or [],
+                    "KEYWORD",
+                    stopwords_for_filtering,
+                )
 
                 def contains_any(tokens):
-                    return any(
-                        t in kw
-                        for kw in kw_list
-                        for t in tokens
-                    ) if tokens else False
+                    return bool(tokens) and any(t in kw_tokens for t in tokens)
 
                 def contains_all(tokens):
-                    if not tokens:
-                        return False
-                    return all(
-                        any(t in kw for kw in kw_list)
-                        for t in tokens
-                    )
+                    return bool(tokens) and all(t in kw_tokens for t in tokens)
 
                 def has_any(tokens):
-                    return any(
-                        t in kw
-                        for kw in kw_list
-                        for t in tokens
-                    ) if tokens else False
+                    return bool(tokens) and any(t in kw_tokens for t in tokens)
 
                 def has_all(tokens):
-                    if not tokens:
-                        return False
-                    return all(
-                        any(t in kw for kw in kw_list)
-                        for t in tokens
-                    )
+                    return bool(tokens) and all(t in kw_tokens for t in tokens)
 
                 if op == "contains_any":
-                    return contains_any(inc)
+                    return contains_any(inc_tokens)
 
                 elif op == "contains_all":
-                    return contains_all(inc)
+                    return contains_all(inc_tokens)
 
                 elif op == "contains_any_exclude_any":
-                    if not contains_any(inc):
+                    if not contains_any(inc_tokens):
                         return False
-                    return not has_any(exc)
+                    return not has_any(exc_tokens)
 
                 elif op == "contains_any_exclude_all":
-                    if not contains_any(inc):
+                    if not contains_any(inc_tokens):
                         return False
-                    if not exc:
+                    if not exc_tokens:
                         return True
-                    return not has_all(exc)
+                    return not has_all(exc_tokens)
 
                 elif op == "contains_all_exclude_any":
-                    if not contains_all(inc):
+                    if not contains_all(inc_tokens):
                         return False
-                    return not has_any(exc)
+                    return not has_any(exc_tokens)
 
                 elif op == "contains_all_exclude_all":
-                    if not contains_all(inc):
+                    if not contains_all(inc_tokens):
                         return False
-                    if not exc:
+                    if not exc_tokens:
                         return True
-                    return not has_all(exc)
+                    return not has_all(exc_tokens)
 
                 elif op == "starts_with":
-                    if not inc:
+                    if not inc_tokens:
                         return False
+                    normalized_keywords = [normalize_german_chars(k) for k in keywords if k is not None]
                     return any(
-                        any(kw.startswith(t) for kw in kw_list)
-                        for t in inc
+                        any(n_kw.startswith(t) for n_kw in normalized_keywords)
+                        for t in inc_tokens
                     )
 
                 else:
