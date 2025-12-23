@@ -151,10 +151,30 @@ def tokenize_class_codes(class_codes) -> List[str]:
     tokens: List[str] = []
     if isinstance(class_codes, list):
         for entry in class_codes:
-            if not isinstance(entry, dict):
+            if entry is None:
                 continue
-            system = entry.get("system")
-            code = entry.get("code")
+            entry_dict = None
+            if isinstance(entry, dict):
+                entry_dict = entry
+            elif hasattr(entry, "asDict"):
+                try:
+                    entry_dict = entry.asDict(recursive=True)
+                except Exception:
+                    entry_dict = None
+            else:
+                try:
+                    entry_dict = {
+                        "system": entry["system"],
+                        "code": entry["code"],
+                    }
+                except Exception:
+                    entry_dict = None
+
+            if not entry_dict:
+                continue
+
+            system = entry_dict.get("system")
+            code = entry_dict.get("code")
             if system is None or code is None:
                 continue
             normalized_system = normalize_class_code_system(system)
@@ -719,6 +739,11 @@ try:
             for m in methods:
                 if m is None:
                     continue
+                if hasattr(m, "asDict"):
+                    try:
+                        m = m.asDict(recursive=True)
+                    except Exception:
+                        pass
                 m_dict = m if isinstance(m, dict) else {
                     "field_name": m["field_name"],
                     "operator": m["operator"],
@@ -1046,9 +1071,13 @@ try:
 
                 return dict_to_sorted_lists(cat_counts)
 
+            def count_class_code_tokens(class_codes):
+                return len(tokenize_class_codes(class_codes))
+
             ds_udf = udf(evaluate_description_short, signal_result_schema)
             kw_udf = udf(evaluate_keywords, signal_result_schema)
             cc_udf = udf(evaluate_class_codes, signal_result_schema)
+            cc_token_count_udf = udf(count_class_code_tokens, IntegerType())
 
             with_signals_df = (
                 enriched_df
@@ -1063,6 +1092,10 @@ try:
                 .withColumn(
                     "cc_result",
                     cc_udf(col("class_codes"), col("assignment_source"))
+                )
+                .withColumn(
+                    "cc_tokens_count",
+                    cc_token_count_udf(col("class_codes"))
                 )
             )
 
@@ -1240,6 +1273,8 @@ try:
             cc_non_empty = stats_df.filter(col("cc_hit")).count()
             ds_non_empty = stats_df.filter(col("ds_hit")).count()
             kw_non_empty = stats_df.filter(col("kw_hit")).count()
+            class_codes_present = with_signals_df.filter(size(col("class_codes")) > 0).count()
+            cc_tokens_present = with_signals_df.filter(col("cc_tokens_count") > 0).count()
 
             unique_counts = {
                 "code_class_match": stats_df.filter(
@@ -1273,6 +1308,8 @@ try:
             print(f"[INFO] PRODUCTS with CLASS_CODES hits: {cc_non_empty}")
             print(f"[INFO] PRODUCTS with DESCRIPTION_SHORT hits: {ds_non_empty}")
             print(f"[INFO] PRODUCTS with KEYWORD hits: {kw_non_empty}")
+            print(f"[INFO] PRODUCTS with non-empty class_codes array: {class_codes_present}")
+            print(f"[INFO] PRODUCTS with non-empty cc_tokens: {cc_tokens_present}")
             print("[INFO] UNIQUE assignment counts by signal combination:")
             for source_key, count_val in unique_counts.items():
                 print(f"[INFO]   {source_key}: {count_val}")
@@ -1280,8 +1317,15 @@ try:
                 "[INFO] MIXED (>=2 signal hits, no unique intersection): "
                 f"{mixed_multi_signal}"
             )
+            code_class_assignments = with_final_df.filter(
+                col("assignment_source").contains("code_class")
+            ).count()
+            print(
+                "[INFO] PRODUCTS with assignment_source containing 'code_class': "
+                f"{code_class_assignments}"
+            )
 
-            final_df = with_final_df.drop("ds_result", "kw_result", "cc_result", "final_result")
+            final_df = with_final_df.drop("ds_result", "kw_result", "cc_result", "final_result", "cc_tokens_count")
 
     print(f"[INFO] final_df rows (after PART-3): {final_df.count()}")
 
