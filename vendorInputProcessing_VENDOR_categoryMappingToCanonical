@@ -28,114 +28,126 @@ from pyspark.sql.functions import udf
 # ---------- Helpers ----------
 
 
-GERMAN_CHAR_MAP = str.maketrans({
-    "ä": "ae",
-    "Ä": "ae",
-    "ö": "oe",
-    "Ö": "oe",
-    "ü": "ue",
-    "Ü": "ue",
-    "ß": "ss",
-})
+TOKEN_PATTERN = re.compile(r"[A-Za-z0-9ÄÖÜäöüß]+")
+TRIM_PATTERN = re.compile(r"^[^A-Za-z0-9ÄÖÜäöüß]+|[^A-Za-z0-9ÄÖÜäöüß]+$")
 
-
-def normalize_german_chars(text: str) -> str:
-    if text is None:
-        return ""
-    if not isinstance(text, str):
-        text = str(text)
-    return text.translate(GERMAN_CHAR_MAP).lower()
-
-
-STOPWORDS_DE_V1 = [
+MIN_TOKEN_LENGTH = 3
+DROP_NUMERIC_ONLY_FIELDS = ["KEYWORD", "DESCRIPTION_SHORT"]
+STOPWORDS_DE_V1: List[str] = [
     "und",
     "oder",
-    "aber",
-    "den",
+    "mit",
+    "ohne",
+    "für",
+    "zum",
+    "zur",
+    "im",
+    "in",
+    "am",
+    "an",
+    "auf",
+    "aus",
+    "bei",
+    "von",
+    "vom",
     "der",
     "die",
     "das",
-    "des",
+    "den",
     "dem",
+    "des",
     "ein",
     "eine",
+    "einer",
+    "eines",
     "einem",
     "einen",
-    "einer",
-    "im",
-    "in",
-    "aus",
-    "auf",
-    "mit",
-    "von",
-    "vom",
-    "zum",
-    "zur",
-    "am",
-    "an",
-    "für",
-    "ohne",
-    "auch",
     "ist",
     "sind",
-    "sein",
-    "bei",
-    "dass",
-    "wie",
-    "als",
-    "so",
-    "noch",
 ]
+
+GERMAN_CHAR_MAP = str.maketrans({
+    "ä": "ae",
+    "ö": "oe",
+    "ü": "ue",
+    "ß": "ss",
+    "Ä": "ae",
+    "Ö": "oe",
+    "Ü": "ue",
+})
+
+
+def normalize_german_chars(token: str) -> str:
+    return token.translate(GERMAN_CHAR_MAP).lower()
 
 
 def build_stopword_set() -> Set[str]:
-    return {normalize_german_chars(w) for w in STOPWORDS_DE_V1 if w}
-
-
-TOKEN_PATTERN = re.compile(r"[a-z0-9]+", re.IGNORECASE)
-TRIM_PATTERN = re.compile(r"^[^a-z0-9]+|[^a-z0-9]+$", re.IGNORECASE)
-
-MIN_TOKEN_LENGTH = 2
-DROP_NUMERIC_ONLY_FIELDS = {"DESCRIPTION_SHORT", "KEYWORD"}
+    stopwords: Set[str] = set()
+    for stopword in STOPWORDS_DE_V1:
+        normalized = normalize_german_chars(stopword)
+        stopwords.add(normalized)
+    return stopwords
 
 
 def tokenize_text_value(value, field_name: str, stopwords: Set[str]) -> List[str]:
-    tokens: List[str] = []
     if value is None:
-        return tokens
+        return []
     if not isinstance(value, str):
         value = str(value)
+    if not value:
+        return []
 
-    normalized = normalize_german_chars(value)
-    normalized = TRIM_PATTERN.sub(" ", normalized)
-
-    for m in TOKEN_PATTERN.finditer(normalized):
-        tok = m.group(0)
-        tok = tok.strip("._-")
-        if len(tok) < MIN_TOKEN_LENGTH:
+    normalized_tokens: List[str] = []
+    for token in TOKEN_PATTERN.findall(value):
+        trimmed = TRIM_PATTERN.sub("", token)
+        if not trimmed:
             continue
-        if field_name in DROP_NUMERIC_ONLY_FIELDS and tok.isnumeric():
+        normalized = normalize_german_chars(trimmed)
+        if not normalized:
             continue
-        if tok in stopwords:
+        numeric_only_candidate = re.sub(r"[^0-9]", "", normalized)
+        if (
+            field_name in DROP_NUMERIC_ONLY_FIELDS
+            and numeric_only_candidate
+            and len(numeric_only_candidate) == len(normalized)
+        ):
             continue
-        tokens.append(tok)
-
-    return tokens
+        if len(normalized) < MIN_TOKEN_LENGTH:
+            continue
+        if normalized in stopwords:
+            continue
+        normalized_tokens.append(normalized)
+    return normalized_tokens
 
 
 def tokenize_keywords(keywords, stopwords: Set[str]) -> List[str]:
-    all_tokens: List[str] = []
-    if not keywords:
-        return all_tokens
-
-    for kw in keywords:
-        all_tokens.extend(tokenize_text_value(kw, "KEYWORD", stopwords))
-
-    return all_tokens
+    tokens: List[str] = []
+    if isinstance(keywords, list):
+        for keyword in keywords:
+            if isinstance(keyword, str):
+                tokens.extend(tokenize_text_value(keyword, "KEYWORD", stopwords))
+    return tokens
 
 
 def tokenize_description(description_short, stopwords: Set[str]) -> List[str]:
-    return tokenize_text_value(description_short, "DESCRIPTION_SHORT", stopwords)
+    if isinstance(description_short, str):
+        return tokenize_text_value(description_short, "DESCRIPTION_SHORT", stopwords)
+    return []
+
+
+def tokenize_class_codes(class_codes) -> List[str]:
+    tokens: List[str] = []
+    if isinstance(class_codes, list):
+        for entry in class_codes:
+            if not isinstance(entry, dict):
+                continue
+            system = entry.get("system")
+            code = entry.get("code")
+            if system is None or code is None:
+                continue
+            normalized_system = normalize_german_chars(str(system))
+            tokens.append(f"{normalized_system}:{code}")
+    return tokens
 
 
 def normalize_rule_tokens(values, field_name: str, stopwords: Set[str]) -> List[str]:
@@ -147,10 +159,6 @@ def normalize_rule_tokens(values, field_name: str, stopwords: Set[str]) -> List[
     if not values:
         return tokens
     for v in values:
-        if v is None:
-            continue
-        if not isinstance(v, str):
-            v = str(v)
         tokens.extend(tokenize_text_value(v, field_name, stopwords))
     return tokens
 
@@ -759,7 +767,10 @@ try:
                 elif op == "starts_with":
                     if not inc_tokens:
                         return False
-                    normalized_text = normalize_german_chars(text)
+                    if not isinstance(text, str):
+                        normalized_text = normalize_german_chars(str(text))
+                    else:
+                        normalized_text = normalize_german_chars(text)
                     return any(normalized_text.startswith(t) for t in inc_tokens)
 
                 else:
@@ -990,7 +1001,11 @@ try:
                 elif op == "starts_with":
                     if not inc_tokens:
                         return False
-                    normalized_keywords = [normalize_german_chars(k) for k in keywords if k is not None]
+                    normalized_keywords = [
+                        normalize_german_chars(str(k))
+                        for k in keywords
+                        if k is not None
+                    ]
                     return any(
                         any(n_kw.startswith(t) for n_kw in normalized_keywords)
                         for t in inc_tokens
