@@ -21,8 +21,9 @@ from pyspark.sql.functions import (
     lit,
     when,
     explode,
+    size,
 )
-from pyspark.sql.types import StructType, StructField, StringType
+from pyspark.sql.types import ArrayType, IntegerType, StructType, StructField, StringType
 from pyspark.sql.functions import udf
 
 # ---------- Helpers ----------
@@ -135,18 +136,52 @@ def tokenize_description(description_short, stopwords: Set[str]) -> List[str]:
     return []
 
 
+def normalize_class_code_system(system: str) -> str:
+    normalized_system = normalize_german_chars(str(system)).lower()
+    if normalized_system.startswith("eclass"):
+        return "eclass-5.1"
+    if normalized_system.startswith("etim-"):
+        return normalized_system
+    if normalized_system.startswith("etim"):
+        return "etim"
+    return normalized_system
+
+
 def tokenize_class_codes(class_codes) -> List[str]:
     tokens: List[str] = []
     if isinstance(class_codes, list):
         for entry in class_codes:
-            if not isinstance(entry, dict):
+            if entry is None:
                 continue
-            system = entry.get("system")
-            code = entry.get("code")
+            entry_dict = None
+            if isinstance(entry, dict):
+                entry_dict = entry
+            elif hasattr(entry, "asDict"):
+                try:
+                    entry_dict = entry.asDict(recursive=True)
+                except Exception:
+                    entry_dict = None
+            else:
+                try:
+                    entry_dict = {
+                        "system": entry["system"],
+                        "code": entry["code"],
+                    }
+                except Exception:
+                    entry_dict = None
+
+            if not entry_dict:
+                continue
+
+            system = entry_dict.get("system")
+            code = entry_dict.get("code")
             if system is None or code is None:
                 continue
-            normalized_system = normalize_german_chars(str(system))
-            tokens.append(f"{normalized_system}:{code}")
+            normalized_system = normalize_class_code_system(system)
+            code_str = str(code).strip()
+            if not code_str:
+                continue
+            tokens.append(f"{normalized_system}:{code_str}")
     return tokens
 
 
@@ -160,6 +195,28 @@ def normalize_rule_tokens(values, field_name: str, stopwords: Set[str]) -> List[
         return tokens
     for v in values:
         tokens.extend(tokenize_text_value(v, field_name, stopwords))
+    return tokens
+
+
+def normalize_class_code_rule_tokens(values) -> List[str]:
+    tokens: List[str] = []
+    if not values:
+        return tokens
+    for v in values:
+        if v is None:
+            continue
+        value_str = str(v).strip()
+        if not value_str:
+            continue
+        if ":" in value_str:
+            system_part, code_part = value_str.split(":", 1)
+            system_norm = normalize_class_code_system(system_part)
+            code_norm = code_part.strip()
+            if not code_norm:
+                continue
+            tokens.append(f"{system_norm}:{code_norm}")
+        else:
+            tokens.append(normalize_class_code_system(value_str))
     return tokens
 
 
@@ -652,15 +709,14 @@ try:
     print(f"[INFO] enriched_df rows (post PART-2 products): {enriched_df.count()}")
 
     # =========================================================
-    # PART-3: description_short-based matching for unmapped products
+    # PART-3: Rule-based matching for unmapped products
     # =========================================================
-    print("[INFO] ===== PART-3: DESCRIPTION_SHORT-based matching for unmapped products =====")
+    print("[INFO] ===== PART-3: Rule-based matching across DESCRIPTION_SHORT, KEYWORD, CLASS_CODES =====")
 
     if mapping_ref_df is None:
         print("[WARN] mapping_ref_df is None; skipping PART-3 (no mapping_methods available).")
-        part3_df = enriched_df
+        final_df = enriched_df
     else:
-        # Build a small lookup structure for DESCRIPTION_SHORT mapping_methods on the driver
         mapping_records = (
             mapping_ref_df
             .select("pim_category_id", "pim_category_name", "mapping_methods")
@@ -668,26 +724,70 @@ try:
         )
 
         mapping_methods_lookup_ds = []
+        mapping_methods_lookup_kw = []
+        mapping_methods_lookup_cc = []
 
         for row in mapping_records:
             pim_id = row["pim_category_id"]
             pim_name = row["pim_category_name"]
             methods = row["mapping_methods"] or []
 
-            # Only keep methods with field_name == "DESCRIPTION_SHORT"
             ds_methods = []
+            kw_methods = []
+            cc_methods = []
+
             for m in methods:
                 if m is None:
                     continue
-                field_name = (m.get("field_name") if isinstance(m, dict) else m["field_name"])
+                if hasattr(m, "asDict"):
+                    try:
+                        m = m.asDict(recursive=True)
+                    except Exception:
+                        pass
+                m_dict = m if isinstance(m, dict) else {
+                    "field_name": m["field_name"],
+                    "operator": m["operator"],
+                    "values_include": m.get("values_include"),
+                    "values_exclude": m.get("values_exclude"),
+                }
+                field_name = m_dict.get("field_name")
+                operator = m_dict.get("operator")
+                values_include = m_dict.get("values_include")
+                values_exclude = m_dict.get("values_exclude")
+
                 if field_name == "DESCRIPTION_SHORT":
-                    op = (m.get("operator") if isinstance(m, dict) else m["operator"])
-                    values_include = (m.get("values_include") if isinstance(m, dict) else m["values_include"])
-                    values_exclude = (m.get("values_exclude") if isinstance(m, dict) else m["values_exclude"])
                     ds_methods.append({
-                        "operator": op,
-                        "values_include": values_include,
-                        "values_exclude": values_exclude,
+                        "operator": operator,
+                        "include_tokens": normalize_rule_tokens(
+                            values_include or [],
+                            "DESCRIPTION_SHORT",
+                            stopwords_for_filtering,
+                        ),
+                        "exclude_tokens": normalize_rule_tokens(
+                            values_exclude or [],
+                            "DESCRIPTION_SHORT",
+                            stopwords_for_filtering,
+                        ),
+                    })
+                elif field_name == "KEYWORD":
+                    kw_methods.append({
+                        "operator": operator,
+                        "include_tokens": normalize_rule_tokens(
+                            values_include or [],
+                            "KEYWORD",
+                            stopwords_for_filtering,
+                        ),
+                        "exclude_tokens": normalize_rule_tokens(
+                            values_exclude or [],
+                            "KEYWORD",
+                            stopwords_for_filtering,
+                        ),
+                    })
+                elif field_name == "CLASS_CODES":
+                    cc_methods.append({
+                        "operator": operator,
+                        "include_tokens": normalize_class_code_rule_tokens(values_include or []),
+                        "exclude_tokens": normalize_class_code_rule_tokens(values_exclude or []),
                     })
 
             if ds_methods:
@@ -697,233 +797,6 @@ try:
                     "methods": ds_methods,
                 })
 
-        if not mapping_methods_lookup_ds:
-            print("[WARN] No DESCRIPTION_SHORT mapping_methods found; skipping PART-3.")
-            part3_df = enriched_df
-        else:
-            print(f"[INFO] Found DESCRIPTION_SHORT mapping_methods for {len(mapping_methods_lookup_ds)} PIM categories.")
-
-            # Prepare Python-side evaluator for operators (DESCRIPTION_SHORT)
-            def method_matches_description(text: str, method: dict) -> bool:
-                if text is None:
-                    return False
-
-                text_tokens = set(tokenize_description(text, stopwords_for_filtering))
-
-                op = (method.get("operator") or "").lower()
-                inc_tokens = normalize_rule_tokens(
-                    method.get("values_include") or [],
-                    "DESCRIPTION_SHORT",
-                    stopwords_for_filtering,
-                )
-                exc_tokens = normalize_rule_tokens(
-                    method.get("values_exclude") or [],
-                    "DESCRIPTION_SHORT",
-                    stopwords_for_filtering,
-                )
-
-                def contains_any(tokens):
-                    return bool(tokens) and any(t in text_tokens for t in tokens)
-
-                def contains_all(tokens):
-                    return bool(tokens) and all(t in text_tokens for t in tokens)
-
-                def has_any(tokens):
-                    return bool(tokens) and any(t in text_tokens for t in tokens)
-
-                def has_all(tokens):
-                    return bool(tokens) and all(t in text_tokens for t in tokens)
-
-                if op == "contains_any":
-                    return contains_any(inc_tokens)
-
-                elif op == "contains_all":
-                    return contains_all(inc_tokens)
-
-                elif op == "contains_any_exclude_any":
-                    if not contains_any(inc_tokens):
-                        return False
-                    return not has_any(exc_tokens)
-
-                elif op == "contains_any_exclude_all":
-                    if not contains_any(inc_tokens):
-                        return False
-                    if not exc_tokens:
-                        return True
-                    return not has_all(exc_tokens)
-
-                elif op == "contains_all_exclude_any":
-                    if not contains_all(inc_tokens):
-                        return False
-                    return not has_any(exc_tokens)
-
-                elif op == "contains_all_exclude_all":
-                    if not contains_all(inc_tokens):
-                        return False
-                    if not exc_tokens:
-                        return True
-                    return not has_all(exc_tokens)
-
-                elif op == "starts_with":
-                    if not inc_tokens:
-                        return False
-                    if not isinstance(text, str):
-                        normalized_text = normalize_german_chars(str(text))
-                    else:
-                        normalized_text = normalize_german_chars(text)
-                    return any(normalized_text.startswith(t) for t in inc_tokens)
-
-                else:
-                    return False
-
-            result_schema_ds = StructType([
-                StructField("pim_category_id_ds", StringType(), True),
-                StructField("pim_category_name_ds", StringType(), True),
-                StructField("assignment_source_ds", StringType(), True),
-                StructField("assignment_confidence_ds", StringType(), True),
-            ])
-
-            def evaluate_description_short(description_short: str, assignment_source: str):
-                """
-                For a given product:
-                  - If assignment_source is already 'existing_category_match' => do nothing.
-                  - Otherwise evaluate DESCRIPTION_SHORT mapping_methods.
-                """
-                if assignment_source == "existing_category_match":
-                    return (None, None, None, None)
-
-                text = description_short or ""
-                if not text:
-                    return (None, None, None, None)
-
-                cat_counts = {}  # pim_id -> (count, pim_name)
-                for entry in mapping_methods_lookup_ds:
-                    pim_id = entry["pim_category_id"]
-                    pim_name = entry["pim_category_name"]
-                    methods = entry["methods"]
-
-                    count = 0
-                    for m in methods:
-                        if method_matches_description(text, m):
-                            count += 1
-
-                    if count > 0:
-                        cat_counts[pim_id] = (count, pim_name)
-
-                if not cat_counts:
-                    return (None, None, None, None)
-
-                if len(cat_counts) == 1:
-                    pim_id, (count, pim_name) = next(iter(cat_counts.items()))
-                    conf_str = str(count)
-                    return (pim_id, pim_name, "description_short_match", conf_str)
-
-                pim_ids_sorted = sorted(cat_counts.keys())
-                pim_names_sorted = [cat_counts[p][1] for p in pim_ids_sorted]
-                pim_id_str = "|".join(pim_ids_sorted)
-                pim_name_str = "|".join(pim_names_sorted)
-                return (pim_id_str, pim_name_str, "description_short_match", "mixed")
-
-            ds_udf = udf(evaluate_description_short, result_schema_ds)
-
-            with_ds_df = enriched_df.withColumn(
-                "ds_result",
-                ds_udf(col("description_short"), col("assignment_source"))
-            )
-
-            part3_df = (
-                with_ds_df
-                .withColumn(
-                    "pim_category_id",
-                    when(
-                        col("assignment_source") == "existing_category_match",
-                        col("pim_category_id")
-                    ).otherwise(
-                        when(
-                            col("ds_result.assignment_source_ds").isNotNull(),
-                            col("ds_result.pim_category_id_ds")
-                        ).otherwise(col("pim_category_id"))
-                    )
-                )
-                .withColumn(
-                    "pim_category_name",
-                    when(
-                        col("assignment_source") == "existing_category_match",
-                        col("pim_category_name")
-                    ).otherwise(
-                        when(
-                            col("ds_result.assignment_source_ds").isNotNull(),
-                            col("ds_result.pim_category_name_ds")
-                        ).otherwise(col("pim_category_name"))
-                    )
-                )
-                .withColumn(
-                    "assignment_source",
-                    when(
-                        col("assignment_source") == "existing_category_match",
-                        col("assignment_source")
-                    ).otherwise(
-                        when(
-                            col("ds_result.assignment_source_ds").isNotNull(),
-                            col("ds_result.assignment_source_ds")
-                        ).otherwise(col("assignment_source"))
-                    )
-                )
-                .withColumn(
-                    "assignment_confidence",
-                    when(
-                        col("assignment_source") == "existing_category_match",
-                        col("assignment_confidence")
-                    ).otherwise(
-                        when(
-                            col("ds_result.assignment_source_ds").isNotNull(),
-                            col("ds_result.assignment_confidence_ds")
-                        ).otherwise(col("assignment_confidence"))
-                    )
-                )
-                .drop("ds_result")
-            )
-
-    print(f"[INFO] part3_df rows (after PART-3): {part3_df.count()}")
-
-    # =========================================================
-    # PART-4: KEYWORD-based matching & combination with DESCRIPTION
-    # =========================================================
-    print("[INFO] ===== PART-4: KEYWORD-based matching =====")
-
-    if mapping_ref_df is None:
-        print("[WARN] mapping_ref_df is None; skipping PART-4 (no mapping_methods available).")
-        final_df = part3_df
-    else:
-        # Build lookup for KEYWORD mapping_methods
-        mapping_records_kw = (
-            mapping_ref_df
-            .select("pim_category_id", "pim_category_name", "mapping_methods")
-            .collect()
-        )
-
-        mapping_methods_lookup_kw = []
-
-        for row in mapping_records_kw:
-            pim_id = row["pim_category_id"]
-            pim_name = row["pim_category_name"]
-            methods = row["mapping_methods"] or []
-
-            kw_methods = []
-            for m in methods:
-                if m is None:
-                    continue
-                field_name = (m.get("field_name") if isinstance(m, dict) else m["field_name"])
-                if field_name == "KEYWORD":
-                    op = (m.get("operator") if isinstance(m, dict) else m["operator"])
-                    values_include = (m.get("values_include") if isinstance(m, dict) else m["values_include"])
-                    values_exclude = (m.get("values_exclude") if isinstance(m, dict) else m["values_exclude"])
-                    kw_methods.append({
-                        "operator": op,
-                        "values_include": values_include,
-                        "values_exclude": values_exclude,
-                    })
-
             if kw_methods:
                 mapping_methods_lookup_kw.append({
                     "pim_category_id": pim_id,
@@ -931,79 +804,135 @@ try:
                     "methods": kw_methods,
                 })
 
-        if not mapping_methods_lookup_kw:
-            print("[WARN] No KEYWORD mapping_methods found; skipping PART-4.")
-            final_df = part3_df
+            if cc_methods:
+                mapping_methods_lookup_cc.append({
+                    "pim_category_id": pim_id,
+                    "pim_category_name": pim_name,
+                    "methods": cc_methods,
+                })
+
+        if not (mapping_methods_lookup_ds or mapping_methods_lookup_kw or mapping_methods_lookup_cc):
+            print("[WARN] No mapping_methods found for DESCRIPTION_SHORT, KEYWORD, or CLASS_CODES; skipping PART-3.")
+            final_df = enriched_df
         else:
+            print(f"[INFO] Found DESCRIPTION_SHORT mapping_methods for {len(mapping_methods_lookup_ds)} PIM categories.")
             print(f"[INFO] Found KEYWORD mapping_methods for {len(mapping_methods_lookup_kw)} PIM categories.")
+            print(f"[INFO] Found CLASS_CODES mapping_methods for {len(mapping_methods_lookup_cc)} PIM categories.")
 
-            # Operator evaluator on list of keywords
-            def method_matches_keywords(keywords, method: dict) -> bool:
-                if not keywords:
-                    return False
+            signal_result_schema = StructType([
+                StructField("pim_ids", ArrayType(StringType()), True),
+                StructField("pim_names", ArrayType(StringType()), True),
+                StructField("counts", ArrayType(IntegerType()), True),
+            ])
 
-                kw_tokens = set(tokenize_keywords(keywords, stopwords_for_filtering))
-
+            def method_matches_description_tokens(text_tokens: Set[str], raw_text, method: dict) -> bool:
                 op = (method.get("operator") or "").lower()
-                inc_tokens = normalize_rule_tokens(
-                    method.get("values_include") or [],
-                    "KEYWORD",
-                    stopwords_for_filtering,
-                )
-                exc_tokens = normalize_rule_tokens(
-                    method.get("values_exclude") or [],
-                    "KEYWORD",
-                    stopwords_for_filtering,
-                )
+                inc_tokens = method.get("include_tokens") or []
+                exc_tokens = method.get("exclude_tokens") or []
 
                 def contains_any(tokens):
-                    return bool(tokens) and any(t in kw_tokens for t in tokens)
+                    return bool(tokens) and any(t in text_tokens for t in tokens)
 
                 def contains_all(tokens):
-                    return bool(tokens) and all(t in kw_tokens for t in tokens)
+                    return bool(tokens) and all(t in text_tokens for t in tokens)
 
                 def has_any(tokens):
-                    return bool(tokens) and any(t in kw_tokens for t in tokens)
+                    return bool(tokens) and any(t in text_tokens for t in tokens)
 
                 def has_all(tokens):
-                    return bool(tokens) and all(t in kw_tokens for t in tokens)
+                    return bool(tokens) and all(t in text_tokens for t in tokens)
 
                 if op == "contains_any":
                     return contains_any(inc_tokens)
 
-                elif op == "contains_all":
+                if op == "contains_all":
                     return contains_all(inc_tokens)
 
-                elif op == "contains_any_exclude_any":
+                if op == "contains_any_exclude_any":
                     if not contains_any(inc_tokens):
                         return False
                     return not has_any(exc_tokens)
 
-                elif op == "contains_any_exclude_all":
+                if op == "contains_any_exclude_all":
                     if not contains_any(inc_tokens):
                         return False
                     if not exc_tokens:
                         return True
                     return not has_all(exc_tokens)
 
-                elif op == "contains_all_exclude_any":
+                if op == "contains_all_exclude_any":
                     if not contains_all(inc_tokens):
                         return False
                     return not has_any(exc_tokens)
 
-                elif op == "contains_all_exclude_all":
+                if op == "contains_all_exclude_all":
                     if not contains_all(inc_tokens):
                         return False
                     if not exc_tokens:
                         return True
                     return not has_all(exc_tokens)
 
-                elif op == "starts_with":
+                if op == "starts_with":
+                    if not inc_tokens:
+                        return False
+                    normalized_text = normalize_german_chars(str(raw_text))
+                    return any(normalized_text.startswith(t) for t in inc_tokens)
+
+                return False
+
+            def method_matches_keywords_tokens(keyword_tokens: Set[str], keywords_raw, method: dict) -> bool:
+                op = (method.get("operator") or "").lower()
+                inc_tokens = method.get("include_tokens") or []
+                exc_tokens = method.get("exclude_tokens") or []
+
+                def contains_any(tokens):
+                    return bool(tokens) and any(t in keyword_tokens for t in tokens)
+
+                def contains_all(tokens):
+                    return bool(tokens) and all(t in keyword_tokens for t in tokens)
+
+                def has_any(tokens):
+                    return bool(tokens) and any(t in keyword_tokens for t in tokens)
+
+                def has_all(tokens):
+                    return bool(tokens) and all(t in keyword_tokens for t in tokens)
+
+                if op == "contains_any":
+                    return contains_any(inc_tokens)
+
+                if op == "contains_all":
+                    return contains_all(inc_tokens)
+
+                if op == "contains_any_exclude_any":
+                    if not contains_any(inc_tokens):
+                        return False
+                    return not has_any(exc_tokens)
+
+                if op == "contains_any_exclude_all":
+                    if not contains_any(inc_tokens):
+                        return False
+                    if not exc_tokens:
+                        return True
+                    return not has_all(exc_tokens)
+
+                if op == "contains_all_exclude_any":
+                    if not contains_all(inc_tokens):
+                        return False
+                    return not has_any(exc_tokens)
+
+                if op == "contains_all_exclude_all":
+                    if not contains_all(inc_tokens):
+                        return False
+                    if not exc_tokens:
+                        return True
+                    return not has_all(exc_tokens)
+
+                if op == "starts_with":
                     if not inc_tokens:
                         return False
                     normalized_keywords = [
                         normalize_german_chars(str(k))
-                        for k in keywords
+                        for k in (keywords_raw or [])
                         if k is not None
                     ]
                     return any(
@@ -1011,33 +940,98 @@ try:
                         for t in inc_tokens
                     )
 
-                else:
-                    return False
+                return False
 
-            result_schema_kw = StructType([
-                StructField("pim_category_id_kw", StringType(), True),
-                StructField("pim_category_name_kw", StringType(), True),
-                StructField("assignment_source_kw", StringType(), True),
-                StructField("assignment_confidence_kw", StringType(), True),
-            ])
+            def method_matches_class_codes_tokens(cc_tokens: Set[str], method: dict) -> bool:
+                op = (method.get("operator") or "").lower()
+                inc_tokens = method.get("include_tokens") or []
+                exc_tokens = method.get("exclude_tokens") or []
 
-            def evaluate_keyword(
-                keywords,
-                assignment_source,
-                assignment_confidence,
-                pim_category_id,
-                pim_category_name,
-            ):
-                # Do not touch existing_category_match
+                def contains_any(tokens):
+                    return bool(tokens) and any(t in cc_tokens for t in tokens)
+
+                def contains_all(tokens):
+                    return bool(tokens) and all(t in cc_tokens for t in tokens)
+
+                def has_any(tokens):
+                    return bool(tokens) and any(t in cc_tokens for t in tokens)
+
+                def has_all(tokens):
+                    return bool(tokens) and all(t in cc_tokens for t in tokens)
+
+                if op == "contains_any":
+                    return contains_any(inc_tokens)
+
+                if op == "contains_all":
+                    return contains_all(inc_tokens)
+
+                if op == "contains_any_exclude_any":
+                    if not contains_any(inc_tokens):
+                        return False
+                    return not has_any(exc_tokens)
+
+                if op == "contains_any_exclude_all":
+                    if not contains_any(inc_tokens):
+                        return False
+                    if not exc_tokens:
+                        return True
+                    return not has_all(exc_tokens)
+
+                if op == "contains_all_exclude_any":
+                    if not contains_all(inc_tokens):
+                        return False
+                    return not has_any(exc_tokens)
+
+                if op == "contains_all_exclude_all":
+                    if not contains_all(inc_tokens):
+                        return False
+                    if not exc_tokens:
+                        return True
+                    return not has_all(exc_tokens)
+
+                return False
+
+            def dict_to_sorted_lists(cat_counts):
+                if not cat_counts:
+                    return ([], [], [])
+                pim_ids_sorted = sorted(cat_counts.keys())
+                pim_names_sorted = [cat_counts[p][1] for p in pim_ids_sorted]
+                counts_sorted = [cat_counts[p][0] for p in pim_ids_sorted]
+                return (pim_ids_sorted, pim_names_sorted, counts_sorted)
+
+            def evaluate_description_short(description_short: str, assignment_source: str):
                 if assignment_source == "existing_category_match":
-                    return (None, None, None, None)
+                    return ([], [], [])
 
-                kw_list = keywords or []
-                if not kw_list:
-                    return (None, None, None, None)
+                text_tokens = set(tokenize_description(description_short, stopwords_for_filtering))
+                if not text_tokens:
+                    return ([], [], [])
 
-                # Compute match_count per PIM category based on KEYWORD methods
-                cat_counts = {}  # pim_id -> (count, pim_name)
+                cat_counts = {}
+                for entry in mapping_methods_lookup_ds:
+                    pim_id = entry["pim_category_id"]
+                    pim_name = entry["pim_category_name"]
+                    methods = entry["methods"]
+
+                    count = 0
+                    for m in methods:
+                        if method_matches_description_tokens(text_tokens, description_short, m):
+                            count += 1
+
+                    if count > 0:
+                        cat_counts[pim_id] = (count, pim_name)
+
+                return dict_to_sorted_lists(cat_counts)
+
+            def evaluate_keywords(keywords, assignment_source: str):
+                if assignment_source == "existing_category_match":
+                    return ([], [], [])
+
+                kw_tokens = set(tokenize_keywords(keywords, stopwords_for_filtering))
+                if not kw_tokens:
+                    return ([], [], [])
+
+                cat_counts = {}
                 for entry in mapping_methods_lookup_kw:
                     pim_id = entry["pim_category_id"]
                     pim_name = entry["pim_category_name"]
@@ -1045,194 +1039,295 @@ try:
 
                     count = 0
                     for m in methods:
-                        if method_matches_keywords(kw_list, m):
+                        if method_matches_keywords_tokens(kw_tokens, keywords, m):
                             count += 1
 
                     if count > 0:
                         cat_counts[pim_id] = (count, pim_name)
 
-                if not cat_counts:
-                    return (None, None, None, None)
+                return dict_to_sorted_lists(cat_counts)
 
-                # Parse existing DESCRIPTION mapping (if any)
-                current_ids = []
-                if pim_category_id:
-                    current_ids = [x for x in pim_category_id.split("|") if x]
+            def evaluate_class_codes(class_codes, assignment_source: str):
+                if assignment_source == "existing_category_match":
+                    return ([], [], [])
 
-                has_description = (assignment_source == "description_short_match") and bool(current_ids)
+                cc_tokens = set(tokenize_class_codes(class_codes))
+                if not cc_tokens:
+                    return ([], [], [])
 
-                # --- Case 1: no description-based assignment yet => keyword-only (r1, r2, r5)
-                if not has_description:
-                    if len(cat_counts) == 1:
-                        pim_id, (count, pim_name) = next(iter(cat_counts.items()))
-                        conf_str = str(count)  # number of KEYWORD methods
-                        return (pim_id, pim_name, "keyword_match", conf_str)
-                    else:
-                        pim_ids_sorted = sorted(cat_counts.keys())
-                        pim_names_sorted = [cat_counts[p][1] for p in pim_ids_sorted]
-                        pim_id_str = "|".join(pim_ids_sorted)
-                        pim_name_str = "|".join(pim_names_sorted)
-                        return (pim_id_str, pim_name_str, "keyword_match", "mixed")
+                cat_counts = {}
+                for entry in mapping_methods_lookup_cc:
+                    pim_id = entry["pim_category_id"]
+                    pim_name = entry["pim_category_name"]
+                    methods = entry["methods"]
 
-                # --- Case 2: description_short_match already exists => combine (r3, r4, r6, r7)
-                # current_ids: DESCRIPTION categories
-                # assignment_confidence: DESCRIPTION confidence (numeric or "mixed")
-                desc_ids = current_ids
-                desc_names_list = (pim_category_name or "").split("|") if pim_category_name else []
-                desc_id_to_name = {}
-                for pid, pname in zip(desc_ids, desc_names_list):
-                    desc_id_to_name[pid] = pname
+                    count = 0
+                    for m in methods:
+                        if method_matches_class_codes_tokens(cc_tokens, m):
+                            count += 1
 
-                # Determine if DESCRIPTION is single-category or multi-category
-                desc_single = len(desc_ids) == 1
-                desc_conf_numeric = False
-                desc_conf_val = 0
-                try:
-                    if assignment_confidence is not None:
-                        desc_conf_val = int(assignment_confidence)
-                        desc_conf_numeric = True
-                except Exception:
-                    desc_conf_numeric = False
+                    if count > 0:
+                        cat_counts[pim_id] = (count, pim_name)
 
-                # Only one KEYWORD category matched
-                if len(cat_counts) == 1:
-                    kw_id, (kw_count, kw_name) = next(iter(cat_counts.items()))
+                return dict_to_sorted_lists(cat_counts)
 
-                    if desc_single:
-                        ds_id = desc_ids[0]
-                        ds_name = desc_id_to_name.get(ds_id, pim_category_name)
+            def count_class_code_tokens(class_codes):
+                return len(tokenize_class_codes(class_codes))
 
-                        if kw_id == ds_id:
-                            # r3/r4: same PIM category; add counts
-                            total_count = kw_count
-                            if desc_conf_numeric:
-                                total_count += desc_conf_val
-                            # if DESCRIPTION conf was "mixed", not expected here; fall back to kw_count
-                            conf_str = str(total_count)
-                            return (
-                                ds_id,
-                                ds_name,
-                                "description_and_keyword_match",
-                                conf_str,
-                            )
-                        else:
-                            # DESCRIPTION -> A, KEYWORD -> B => union {A,B}, mixed
-                            union_ids = set(desc_ids)
-                            union_ids.add(kw_id)
-                            id_to_name = dict(desc_id_to_name)
-                            id_to_name[kw_id] = kw_name
-                            ordered_ids = sorted(union_ids)
-                            ordered_names = [id_to_name[i] for i in ordered_ids]
-                            return (
-                                "|".join(ordered_ids),
-                                "|".join(ordered_names),
-                                "description_and_keyword_match",
-                                "mixed",
-                            )
-                    else:
-                        # DESCRIPTION already multi-category; union with KW category
-                        union_ids = set(desc_ids)
-                        union_ids.add(kw_id)
-                        id_to_name = dict(desc_id_to_name)
-                        id_to_name[kw_id] = kw_name
-                        ordered_ids = sorted(union_ids)
-                        ordered_names = [id_to_name[i] for i in ordered_ids]
-                        return (
-                            "|".join(ordered_ids),
-                            "|".join(ordered_names),
-                            "description_and_keyword_match",
-                            "mixed",
-                        )
+            ds_udf = udf(evaluate_description_short, signal_result_schema)
+            kw_udf = udf(evaluate_keywords, signal_result_schema)
+            cc_udf = udf(evaluate_class_codes, signal_result_schema)
+            cc_token_count_udf = udf(count_class_code_tokens, IntegerType())
 
-                # Multiple KEYWORD categories matched
-                # r6 / r7: union DESCRIPTION + KEYWORD categories, mixed
-                union_ids = set(desc_ids)
-                id_to_name = dict(desc_id_to_name)
+            with_signals_df = (
+                enriched_df
+                .withColumn(
+                    "ds_result",
+                    ds_udf(col("description_short"), col("assignment_source"))
+                )
+                .withColumn(
+                    "kw_result",
+                    kw_udf(col("keywords"), col("assignment_source"))
+                )
+                .withColumn(
+                    "cc_result",
+                    cc_udf(col("class_codes"), col("assignment_source"))
+                )
+                .withColumn(
+                    "cc_tokens_count",
+                    cc_token_count_udf(col("class_codes"))
+                )
+            )
 
-                for pid, (kw_count, kw_name) in cat_counts.items():
-                    union_ids.add(pid)
-                    id_to_name[pid] = kw_name
+            final_result_schema = StructType([
+                StructField("pim_category_id_final", StringType(), True),
+                StructField("pim_category_name_final", StringType(), True),
+                StructField("assignment_source_final", StringType(), True),
+                StructField("assignment_confidence_final", StringType(), True),
+            ])
 
-                ordered_ids = sorted(union_ids)
-                ordered_names = [id_to_name[i] for i in ordered_ids]
+            source_map = {
+                frozenset({"code_class"}): "code_class_match",
+                frozenset({"description_short"}): "description_short_match",
+                frozenset({"keyword"}): "keyword_match",
+                frozenset({"code_class", "description_short"}): "code_class_and_description_short_match",
+                frozenset({"code_class", "keyword"}): "code_class_and_keyword_match",
+                frozenset({"description_short", "keyword"}): "description_short_and_keyword_match",
+                frozenset({"code_class", "description_short", "keyword"}): "code_class_and_description_short_and_keyword_match",
+            }
+
+            def build_count_lookup(ids, names, counts):
+                lookup = {}
+                if ids is None:
+                    return lookup
+                for pid, name, cnt in zip(ids, names or [], counts or []):
+                    lookup[pid] = (cnt, name)
+                return lookup
+
+            def pick_name_for_id(target_id, lookups):
+                for lookup in lookups:
+                    if target_id in lookup and lookup[target_id][1]:
+                        return lookup[target_id][1]
+                return target_id
+
+            def finalize_assignment(
+                pim_category_id,
+                pim_category_name,
+                assignment_source,
+                assignment_confidence,
+                ds_result,
+                kw_result,
+                cc_result,
+            ):
+                if assignment_source == "existing_category_match":
+                    return (
+                        pim_category_id,
+                        pim_category_name,
+                        assignment_source,
+                        assignment_confidence,
+                    )
+
+                ds_ids = (ds_result["pim_ids"] if ds_result else []) or []
+                kw_ids = (kw_result["pim_ids"] if kw_result else []) or []
+                cc_ids = (cc_result["pim_ids"] if cc_result else []) or []
+
+                ds_names = (ds_result["pim_names"] if ds_result else []) or []
+                kw_names = (kw_result["pim_names"] if kw_result else []) or []
+                cc_names = (cc_result["pim_names"] if cc_result else []) or []
+
+                ds_counts = (ds_result["counts"] if ds_result else []) or []
+                kw_counts = (kw_result["counts"] if kw_result else []) or []
+                cc_counts = (cc_result["counts"] if cc_result else []) or []
+
+                ds_lookup = build_count_lookup(ds_ids, ds_names, ds_counts)
+                kw_lookup = build_count_lookup(kw_ids, kw_names, kw_counts)
+                cc_lookup = build_count_lookup(cc_ids, cc_names, cc_counts)
+
+                ds_set = set(ds_lookup.keys())
+                kw_set = set(kw_lookup.keys())
+                cc_set = set(cc_lookup.keys())
+
+                hits = set()
+                if cc_set:
+                    hits.add("code_class")
+                if ds_set:
+                    hits.add("description_short")
+                if kw_set:
+                    hits.add("keyword")
+
+                if not hits:
+                    return (pim_category_id, pim_category_name, assignment_source, assignment_confidence)
+
+                non_empty_sets = [s for s in [cc_set, ds_set, kw_set] if s]
+                intersection = set.intersection(*non_empty_sets) if non_empty_sets else set()
+
+                if len(intersection) == 1:
+                    target_id = next(iter(intersection))
+                    total_count = (
+                        ds_lookup.get(target_id, (0, None))[0]
+                        + kw_lookup.get(target_id, (0, None))[0]
+                        + cc_lookup.get(target_id, (0, None))[0]
+                    )
+                    target_name = pick_name_for_id(
+                        target_id,
+                        [cc_lookup, ds_lookup, kw_lookup],
+                    )
+                    source_val = source_map.get(frozenset(hits))
+                    return (
+                        target_id,
+                        target_name,
+                        source_val,
+                        str(total_count),
+                    )
+
+                all_ids = sorted(ds_set | kw_set | cc_set)
+                name_lookup = {}
+                for pid, (_, name) in ds_lookup.items():
+                    name_lookup[pid] = name or pid
+                for pid, (_, name) in kw_lookup.items():
+                    if pid not in name_lookup:
+                        name_lookup[pid] = name or pid
+                for pid, (_, name) in cc_lookup.items():
+                    if pid not in name_lookup:
+                        name_lookup[pid] = name or pid
+
+                pim_id_str = "|".join(all_ids) if all_ids else None
+                pim_name_str = "|".join([name_lookup.get(pid, pid) for pid in all_ids]) if all_ids else None
+                source_val = source_map.get(frozenset(hits))
 
                 return (
-                    "|".join(ordered_ids),
-                    "|".join(ordered_names),
-                    "description_and_keyword_match",
+                    pim_id_str,
+                    pim_name_str,
+                    source_val,
                     "mixed",
                 )
 
-            kw_udf = udf(
-                evaluate_keyword,
-                result_schema_kw
+            finalize_udf = udf(
+                finalize_assignment,
+                final_result_schema,
             )
 
-            with_kw_df = part3_df.withColumn(
-                "kw_result",
-                kw_udf(
-                    col("keywords"),
-                    col("assignment_source"),
-                    col("assignment_confidence"),
-                    col("pim_category_id"),
-                    col("pim_category_name"),
-                ),
-            )
-
-            final_df = (
-                with_kw_df
+            with_final_df = (
+                with_signals_df
+                .withColumn(
+                    "final_result",
+                    finalize_udf(
+                        col("pim_category_id"),
+                        col("pim_category_name"),
+                        col("assignment_source"),
+                        col("assignment_confidence"),
+                        col("ds_result"),
+                        col("kw_result"),
+                        col("cc_result"),
+                    ),
+                )
                 .withColumn(
                     "pim_category_id",
-                    when(
-                        col("assignment_source") == "existing_category_match",
-                        col("pim_category_id")
-                    ).otherwise(
-                        when(
-                            col("kw_result.assignment_source_kw").isNotNull(),
-                            col("kw_result.pim_category_id_kw")
-                        ).otherwise(col("pim_category_id"))
-                    )
+                    col("final_result.pim_category_id_final")
                 )
                 .withColumn(
                     "pim_category_name",
-                    when(
-                        col("assignment_source") == "existing_category_match",
-                        col("pim_category_name")
-                    ).otherwise(
-                        when(
-                            col("kw_result.assignment_source_kw").isNotNull(),
-                            col("kw_result.pim_category_name_kw")
-                        ).otherwise(col("pim_category_name"))
-                    )
+                    col("final_result.pim_category_name_final")
                 )
                 .withColumn(
                     "assignment_source",
-                    when(
-                        col("assignment_source") == "existing_category_match",
-                        col("assignment_source")
-                    ).otherwise(
-                        when(
-                            col("kw_result.assignment_source_kw").isNotNull(),
-                            col("kw_result.assignment_source_kw")
-                        ).otherwise(col("assignment_source"))
-                    )
+                    col("final_result.assignment_source_final")
                 )
                 .withColumn(
                     "assignment_confidence",
-                    when(
-                        col("assignment_source") == "existing_category_match",
-                        col("assignment_confidence")
-                    ).otherwise(
-                        when(
-                            col("kw_result.assignment_source_kw").isNotNull(),
-                            col("kw_result.assignment_confidence_kw")
-                        ).otherwise(col("assignment_confidence"))
-                    )
+                    col("final_result.assignment_confidence_final")
                 )
-                .drop("kw_result")
             )
 
-    print(f"[INFO] final_df rows (after PART-4): {final_df.count()}")
+            stats_df = (
+                with_final_df
+                .withColumn("ds_hit", size(col("ds_result.pim_ids")) > 0)
+                .withColumn("kw_hit", size(col("kw_result.pim_ids")) > 0)
+                .withColumn("cc_hit", size(col("cc_result.pim_ids")) > 0)
+                .withColumn(
+                    "hits_count",
+                    col("ds_hit").cast("int") + col("kw_hit").cast("int") + col("cc_hit").cast("int"),
+                )
+            )
+
+            cc_non_empty = stats_df.filter(col("cc_hit")).count()
+            ds_non_empty = stats_df.filter(col("ds_hit")).count()
+            kw_non_empty = stats_df.filter(col("kw_hit")).count()
+            class_codes_present = with_signals_df.filter(size(col("class_codes")) > 0).count()
+            cc_tokens_present = with_signals_df.filter(col("cc_tokens_count") > 0).count()
+
+            unique_counts = {
+                "code_class_match": stats_df.filter(
+                    (col("assignment_confidence") != "mixed") & (col("assignment_source") == "code_class_match")
+                ).count(),
+                "description_short_match": stats_df.filter(
+                    (col("assignment_confidence") != "mixed") & (col("assignment_source") == "description_short_match")
+                ).count(),
+                "keyword_match": stats_df.filter(
+                    (col("assignment_confidence") != "mixed") & (col("assignment_source") == "keyword_match")
+                ).count(),
+                "code_class_and_description_short_match": stats_df.filter(
+                    (col("assignment_confidence") != "mixed") & (col("assignment_source") == "code_class_and_description_short_match")
+                ).count(),
+                "code_class_and_keyword_match": stats_df.filter(
+                    (col("assignment_confidence") != "mixed") & (col("assignment_source") == "code_class_and_keyword_match")
+                ).count(),
+                "description_short_and_keyword_match": stats_df.filter(
+                    (col("assignment_confidence") != "mixed") & (col("assignment_source") == "description_short_and_keyword_match")
+                ).count(),
+                "code_class_and_description_short_and_keyword_match": stats_df.filter(
+                    (col("assignment_confidence") != "mixed") & (col("assignment_source") == "code_class_and_description_short_and_keyword_match")
+                ).count(),
+            }
+
+            mixed_multi_signal = stats_df.filter(
+                (col("assignment_confidence") == "mixed")
+                & (col("hits_count") >= 2)
+            ).count()
+
+            print(f"[INFO] PRODUCTS with CLASS_CODES hits: {cc_non_empty}")
+            print(f"[INFO] PRODUCTS with DESCRIPTION_SHORT hits: {ds_non_empty}")
+            print(f"[INFO] PRODUCTS with KEYWORD hits: {kw_non_empty}")
+            print(f"[INFO] PRODUCTS with non-empty class_codes array: {class_codes_present}")
+            print(f"[INFO] PRODUCTS with non-empty cc_tokens: {cc_tokens_present}")
+            print("[INFO] UNIQUE assignment counts by signal combination:")
+            for source_key, count_val in unique_counts.items():
+                print(f"[INFO]   {source_key}: {count_val}")
+            print(
+                "[INFO] MIXED (>=2 signal hits, no unique intersection): "
+                f"{mixed_multi_signal}"
+            )
+            code_class_assignments = with_final_df.filter(
+                col("assignment_source").contains("code_class")
+            ).count()
+            print(
+                "[INFO] PRODUCTS with assignment_source containing 'code_class': "
+                f"{code_class_assignments}"
+            )
+
+            final_df = with_final_df.drop("ds_result", "kw_result", "cc_result", "final_result", "cc_tokens_count")
+
+    print(f"[INFO] final_df rows (after PART-3): {final_df.count()}")
 
     # -------------------------
     # Write FINAL result back to SAME final_key (overwrite)
